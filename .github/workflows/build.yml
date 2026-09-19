@@ -165,8 +165,8 @@ jobs:
             echo "Building ALL architectures"
             echo "matrix={\"include\":[$ARMV7,$AARCH64,$AMD64,$I386]}" >> "$GITHUB_OUTPUT"
           else
-            echo "Branch push: building amd64 only. Use the all_arches input, or push a tag, for the full set."
-            echo "matrix={\"include\":[$AMD64]}" >> "$GITHUB_OUTPUT"
+            echo "Branch push: building aarch64 only (push-codeAI fork: Raspberry Pi target). Use the all_arches input, or push a tag, for the full set."
+            echo "matrix={\"include\":[$AARCH64]}" >> "$GITHUB_OUTPUT"
           fi
 
   build:
