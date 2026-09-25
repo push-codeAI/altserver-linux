@@ -70,6 +70,22 @@ $(idevice_obj) : $(idevice_patched_src)
 	$(CC) $(CFLAGS) $(EXTRA_FLAGS) -I$(LIB_DIR)/libimobiledevice/src -o $@ -c $<
 # -------------------------------------------------------------------------------------------
 
+# --- AltServer-Linux: rewrite libusbmuxd.c at build time ----------------------------------------
+# See rewrite_libusbmuxd_source.py: the device-event monitor reconnected with no delay and leaked
+# one fd per reconnect (a mux that accepts and drops => ~1000 fds/s => "stack smashing detected"),
+# and never came back after a netmuxd restart. Same temp-file/rename discipline as idevice.c above.
+libusbmuxd_patched_src := $(BUILD_DIR)/patched/libusbmuxd/libusbmuxd.c
+libusbmuxd_obj := $(BUILD_DIR)/objs/libraries/libusbmuxd/src/libusbmuxd.c.o
+
+$(libusbmuxd_patched_src) : $(LIB_DIR)/libusbmuxd/src/libusbmuxd.c $(ROOT_DIR)/rewrite_libusbmuxd_source.py
+	mkdir -p $(@D)
+	python3 $(ROOT_DIR)/rewrite_libusbmuxd_source.py "$<" > $@.$$$$.tmp && mv $@.$$$$.tmp $@
+
+$(libusbmuxd_obj) : $(libusbmuxd_patched_src)
+	mkdir -p $(@D)
+	$(CC) $(CFLAGS) $(EXTRA_FLAGS) -o $@ -c $<
+# -------------------------------------------------------------------------------------------
+
 libplist_obj := $(libplist_src:$(MAIN_DIR)/%=$(BUILD_DIR)/objs/%.o)
 $(libplist_obj) : EXTRA_FLAGS := -I$(ROOT_DIR) $(libplist_include) -I$(LIB_DIR)/libplist/libcnary/include -I$(LIB_DIR)/libplist/src
 $(BUILD_DIR)/libplist.a : $(libplist_obj)

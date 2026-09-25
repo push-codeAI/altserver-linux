@@ -88,6 +88,16 @@ jobs:
       - name: Install-log redaction actually redacts
         run: python3 tests/check_redaction.py
 
+      # A phone that closed or reset its connection mid-request left a worker spinning at 100% of a
+      # core and logging ~700,000 lines a second, forever; one that vanished without a FIN held a
+      # worker forever, and cpprestsdk has 40. Needs the real submodule: the guard also proves the
+      # rewriter still matches it, and compiles its output against stubs (no cpprestsdk needed).
+      - name: Fetch the AltServer submodule
+        run: git submodule update --init --depth 1 upstream_repo
+
+      - name: The TCP transport survives a phone that goes away
+        run: python3 tests/check_wireless_connection.py
+
       # One 100 MB app upload printed 52,871 per-chunk progress lines: 5 MB of docker log, and every
       # useful line pushed out of the 1 MB file the web UI shows. The filter now folds them; this
       # fails if it ever drops, reorders or delays anything else, or stops recording refreshes.
