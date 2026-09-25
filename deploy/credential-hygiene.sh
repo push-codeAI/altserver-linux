@@ -65,16 +65,25 @@ for c in altserver altserver-web anisette netmuxd; do
         note "$c: no json-file log on disk (driver may not be json-file)"
         continue
     fi
-    size=$(sudo du -h "$logpath" 2>/dev/null | cut -f1)
+    # The json-file driver ROTATES: with max-file 3 the older history sits in <log>.1 and <log>.2
+    # (gzipped when log-opts compress is on), and it holds exactly the same kind of lines. Checking
+    # only the active file reported a host as clean while two rotated files still held tokens.
+    logs=("$logpath")
+    while IFS= read -r rotated; do
+        [ -n "$rotated" ] && logs+=("$rotated")
+    done < <(sudo find "$(dirname "$logpath")" -maxdepth 1 -name "$(basename "$logpath").*" 2>/dev/null | sort)
+    size=$(sudo du -ch "${logs[@]}" 2>/dev/null | tail -n 1 | cut -f1)
     # Count, never print. A hit means credential material is sitting in this file.
     # Count lines that carry a marker but are NOT already redacted. Since docker/redact-log.py
     # masks the VALUE and keeps the LABEL, a successfully filtered line still contains the word
     # "MachineID" -- so a naive marker count reports a leak for a log that is doing its job.
-    hits=$(sudo grep -aiE 'GsIdmsToken|com\.apple\.gs\.|adsid|DsPrsId|MachineID|X-Apple-I-MD' "$logpath" 2>/dev/null \
+    # zgrep reads plain and gzipped files alike; -h keeps file names out of the counted lines.
+    hits=$(sudo zgrep -ahiE 'GsIdmsToken|com\.apple\.gs\.|adsid|DsPrsId|MachineID|X-Apple-I-MD' "${logs[@]}" 2>/dev/null \
            | grep -avc '\[withheld\]')
     hits=${hits:-0}
-    redacted=$(sudo grep -ac '\[withheld\]' "$logpath" 2>/dev/null)
+    redacted=$(sudo zgrep -ah '\[withheld\]' "${logs[@]}" 2>/dev/null | wc -l)
     redacted=${redacted:-0}
+    [ ${#logs[@]} -gt 1 ] && size="${size:-?} in ${#logs[@]} files"
     if [ "${hits:-0}" -gt 0 ]; then
         flag "$c: ${size:-?} log, $hits line(s) carrying credentials or machine identity"
     elif [ "${redacted:-0}" -gt 0 ]; then
@@ -84,6 +93,9 @@ for c in altserver altserver-web anisette netmuxd; do
     fi
     if [ "$CLEAN_LOGS" = "1" ]; then
         sudo truncate -s 0 "$logpath" && note "    truncated (container keeps running; only history is lost)"
+        for rotated in "${logs[@]:1}"; do
+            sudo rm -f -- "$rotated" && note "    removed rotated $(basename "$rotated")"
+        done
     fi
 done
 

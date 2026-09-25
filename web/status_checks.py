@@ -518,6 +518,73 @@ def check_altserver_running():
                    "Trust the mDNS check above over this one.")
 
 
+# Written by docker/redact-log.py when a refresh installs profiles and finishes without error.
+LAST_REFRESH = os.environ.get("ALTSERVER_LAST_REFRESH", "/data/last-refresh.json")
+REFRESH_WARN_DAYS = 4
+REFRESH_FAIL_DAYS = 6
+
+
+def _ago(seconds):
+    if seconds < 3600:
+        return "%d min" % (seconds // 60)
+    if seconds < 2 * 86400:
+        return "%.1f hours" % (seconds / 3600)
+    return "%.1f days" % (seconds / 86400)
+
+
+def check_last_refresh(path=None, now=None):
+    """The one health fact a 7-day certificate actually depends on: when did a refresh last land?
+
+    Every other check here says whether a refresh COULD work. None says whether one DID, and the
+    log cannot either: one app upload pushes everything else out of it. A free Apple ID's profiles
+    expire 7 days after they were installed, so WARN after 4 days (a 3-day cycle has been missed)
+    and FAIL after 6 (one day left).
+
+    Only refreshes that pass through the daemon's log filter are recorded: AltStore-initiated
+    refreshes and installs. A CLI install whose output is not piped through redact-log is not.
+    """
+    path = path or LAST_REFRESH
+    now = time.time() if now is None else now
+    name = "Last successful refresh"
+    try:
+        with open(path, encoding="utf-8") as f:
+            data = json.load(f)
+        last = data.get("last_success") or {}
+        failure = data.get("last_failure") or {}
+    except FileNotFoundError:
+        return _result(name, UNKNOWN, "No refresh recorded yet", "Nothing at %s." % path,
+                       "It is written the first time AltServer installs profiles on the phone "
+                       "(refresh from AltStore once). Needs an image whose redact-log records it.")
+    except Exception as exc:
+        return _result(name, UNKNOWN, "Could not read %s" % path, str(exc))
+
+    epoch = last.get("epoch") if isinstance(last.get("epoch"), (int, float)) else None
+    detail = ""
+    if isinstance(failure.get("epoch"), (int, float)) and failure["epoch"] > (epoch or 0):
+        detail = "Newer failure %s ago: %s" % (_ago(max(0, now - failure["epoch"])),
+                                                failure.get("line", ""))
+    if epoch is None:
+        return _result(name, UNKNOWN, "No successful refresh recorded yet", detail)
+
+    age = now - epoch
+    detail = ("%s (%s)" % (last.get("line", ""), last.get("time", ""))
+              + (" | " + detail if detail else ""))
+    if age < -300:
+        return _result(name, WARN, "Recorded refresh time is in the future", detail,
+                       "This host's clock has jumped backwards. Check NTP.")
+    summary = "Last successful refresh: %s ago" % _ago(max(0, age))
+    if age > REFRESH_FAIL_DAYS * 86400:
+        return _result(name, FAIL, summary, detail,
+                       "Profiles from a free Apple ID expire 7 days after install. Refresh from "
+                       "AltStore now (on the home Wi-Fi or the VPN) and check the log for why "
+                       "the scheduled refreshes did not land.")
+    if age > REFRESH_WARN_DAYS * 86400:
+        return _result(name, WARN, summary, detail,
+                       "At least one refresh cycle has been missed. Refresh from AltStore before "
+                       "day 7, when the apps stop opening.")
+    return _result(name, OK, summary, detail)
+
+
 def run_all(anisette_url=None):
     """Run every check, in parallel apart from the one real dependency.
 
@@ -539,7 +606,7 @@ def run_all(anisette_url=None):
         return check_clock(anisette.get("anisette_time"), anisette.get("anisette_skew"))
 
     rest = [_clock, check_device, check_phone_advertisement,
-            check_advertisement, check_altserver_running]
+            check_advertisement, check_altserver_running, check_last_refresh]
 
     results = [None] * len(rest)
     with concurrent.futures.ThreadPoolExecutor(max_workers=len(rest)) as pool:

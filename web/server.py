@@ -269,7 +269,10 @@ function setWatching(on, reason){
 
 logBtn.addEventListener('click', () => setWatching(logTimer === null));
 
-load(); setInterval(load, 30000);
+// Only while the tab is visible: every poll makes anisette log the machine identity and
+// netmuxd print its device list, so a forgotten tab fills both logs around the clock.
+load(); setInterval(() => { if (!document.hidden) load(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 </script>
 </body>
 </html>
@@ -317,7 +320,10 @@ async function load(){
       '<span class="summary">Status service unreachable</span></div></div>';
   }
 }
-load(); setInterval(load, 5000);
+// Only while the tab is visible: every poll makes anisette log the machine identity and
+// netmuxd print its device list, so a forgotten tab fills both logs around the clock.
+load(); setInterval(() => { if (!document.hidden) load(); }, 5000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 </script>
 </body>
 </html>

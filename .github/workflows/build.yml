@@ -88,6 +88,12 @@ jobs:
       - name: Install-log redaction actually redacts
         run: python3 tests/check_redaction.py
 
+      # One 100 MB app upload printed 52,871 per-chunk progress lines: 5 MB of docker log, and every
+      # useful line pushed out of the 1 MB file the web UI shows. The filter now folds them; this
+      # fails if it ever drops, reorders or delays anything else, or stops recording refreshes.
+      - name: Log filter folds progress without losing lines
+        run: python3 tests/check_log_filter.py
+
       # The clock check compared the anisette timestamp with this host's clock -- on one host the
       # same kernel clock -- so a Pi running hours slow after a power cut read "within 0s". It
       # also fetched "/" every 30 s, which on current anisette images provisions against Apple.
