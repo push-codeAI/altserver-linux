@@ -88,27 +88,52 @@ for c in altserver altserver-web anisette netmuxd; do
 done
 
 hr; echo "STRAY COPIES -- nothing in the running stack needs these"; hr
-strays=()
-[ -d "$HOME/AltServerData" ] && strays+=("$HOME/AltServerData")
-for g in "$HOME"/anisette-state*.tgz "$HOME"/anisette-identity*.tgz "$HOME"/lockdown-backup*.tgz; do
-    [ -e "$g" ] && strays+=("$g")
-done
-if [ ${#strays[@]} -eq 0 ]; then
-    note "none found"
-else
-    for s in "${strays[@]}"; do
-        flag "$(du -sh "$s" 2>/dev/null | cut -f1)  $s"
+
+# ~/AltServerData is only a stray when the daemon runs in the container. A bare-metal deployment
+# (the static binary, e.g. under systemd) keeps its signing certificate in ./AltServerData relative
+# to its working directory -- often $HOME -- and deleting that is not cleanup: the next install
+# finds no cached .p12, REVOKES the certificate, and every sideloaded app, AltStore included,
+# stops launching. So it counts as live when any AltServer process has $HOME as its working
+# directory, or when there is no altserver container at all.
+altserverdata_live() {
+    local pid cwd
+    for pid in $(pgrep -f AltServer 2>/dev/null); do
+        cwd=$(sudo readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+        [ "$cwd" = "$HOME" ] && return 0
     done
-    note ""
-    note "AltServerData holds a .p12 -- the PRIVATE KEY for your signing certificate."
-    note "The tarballs are backups. Deleting them loses your only disaster-recovery path"
-    note "for the anisette identity and pairing record, so keep them somewhere else first"
-    note "if you want them."
-    if [ "$CLEAN_STRAYS" = "1" ]; then
-        for s in "${strays[@]}"; do
-            rm -rf -- "$s" && note "    removed $s"
-        done
+    ! docker inspect altserver >/dev/null 2>&1
+}
+
+strays=()
+if [ -d "$HOME/AltServerData" ]; then
+    if altserverdata_live; then
+        note "$HOME/AltServerData: LIVE working state of a bare-metal AltServer -- never removed here"
+    else
+        strays+=("$HOME/AltServerData")
     fi
+fi
+
+# The tarballs are the backups README.md step 7 tells you to take. They hold identifying material,
+# so they are reported -- but never deleted by a flag: they are the only disaster-recovery path for
+# the anisette identity and the pairing record, and losing the latter means fetching the cable.
+backups=()
+for g in "$HOME"/anisette-state*.tgz "$HOME"/anisette-identity*.tgz "$HOME"/lockdown-backup*.tgz; do
+    [ -e "$g" ] && backups+=("$g")
+done
+
+if [ ${#strays[@]} -eq 0 ] && [ ${#backups[@]} -eq 0 ]; then
+    note "none found"
+fi
+for s in "${strays[@]}"; do
+    flag "$(du -sh "$s" 2>/dev/null | cut -f1)  $s  (holds a .p12 -- the PRIVATE KEY for your signing certificate)"
+done
+for b in "${backups[@]}"; do
+    flag "$(du -sh "$b" 2>/dev/null | cut -f1)  $b  (backup: move it off this host; not removed by any flag)"
+done
+if [ "$CLEAN_STRAYS" = "1" ]; then
+    for s in "${strays[@]}"; do
+        rm -rf -- "$s" && note "    removed $s"
+    done
 fi
 
 hr; echo "INTERRUPTED INSTALLS -- signed bundles left in container /tmp"; hr
