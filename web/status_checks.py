@@ -21,11 +21,15 @@ checks exist to turn that into something visible.
 
 import calendar
 import concurrent.futures
+import ctypes
+import email.utils
+import hashlib
 import json
 import os
 import shutil
 import socket
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
@@ -70,8 +74,51 @@ def _run(cmd, timeout=10, env=None):
         return None, "%s could not be run: %s" % (cmd[0], exc)
 
 
+# How often this page may call the anisette server's "/". That is the one endpoint that runs the
+# ADI machinery, logs the full identity at INFO (anisette-v3-server app.d:225), and -- in images
+# built from upstream b76cd01 (2026-04-04) on, i.e. the current :latest -- PROVISIONS AGAINST
+# APPLE whenever the machine is unprovisioned (app.d:199-203). This page polls every 30 s and a
+# watchdog polling /api/status multiplies that; none of it needs a fresh one-time password.
+# Liveness is checked on every poll via /v3/client_info instead, which is a static reply
+# (app.d:228-240): no ADI, no Apple, no file I/O.
+ANISETTE_CONTRACT_INTERVAL = int(os.environ.get("ALTSERVER_ANISETTE_CHECK_INTERVAL", "600"))
+_anisette_lock = threading.Lock()
+_anisette_cache = {}  # url -> (monotonic expiry, result)
+
+# The machine identity Apple sees is X-Mme-Device-Id (device.json) plus X-Apple-I-MD-M (the ADI
+# machine ID in adi.pb). If either changes, the next sign-in is a NEW machine and needs 2FA, which
+# an unattended refresh can never answer. Only a fingerprint is stored, and only when first seen.
+ANISETTE_IDENTITY_FILE = os.environ.get("ALTSERVER_ANISETTE_IDENTITY_FILE",
+                                        "/data/.anisette-identity")
+
+
+def _identity_note(data):
+    """'' if unchanged or not trackable, else a description of the change."""
+    fingerprint = hashlib.sha256(("%s|%s" % (data.get("X-Mme-Device-Id"),
+                                             data.get("X-Apple-I-MD-M"))).encode()).hexdigest()[:16]
+    path = ANISETTE_IDENTITY_FILE
+    try:
+        with open(path) as fh:
+            known = fh.read().split()
+    except FileNotFoundError:
+        try:
+            if path and os.access(os.path.dirname(path) or ".", os.W_OK):
+                with open(path, "w") as fh:
+                    fh.write("%s %s\n" % (fingerprint,
+                                          time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())))
+        except OSError:
+            pass  # untracked is better than a status page that throws
+        return ""
+    except OSError:
+        return ""
+    if known and known[0] != fingerprint:
+        return ("identity fingerprint %s differs from %s recorded %s"
+                % (fingerprint, known[0], known[1] if len(known) > 1 else "earlier"))
+    return ""
+
+
 def check_anisette(url=None):
-    """Fetch anisette data and validate it against the client's actual contract."""
+    """Liveness on every call; the full contract at most every ANISETTE_CONTRACT_INTERVAL s."""
     url = url or os.environ.get("ALTSERVER_ANISETTE_SERVER", "")
 
     if not url:
@@ -86,10 +133,34 @@ def check_anisette(url=None):
                        "sending anything. Use e.g. http://127.0.0.1:6969")
 
     try:
+        with urllib.request.urlopen(url.rstrip("/") + "/v3/client_info", timeout=10) as resp:
+            resp.read(4096)
+    except urllib.error.HTTPError:
+        pass  # alive, just no v3 API (a v1-only server); the contract check below still runs
+    except Exception as exc:
+        return _result("Anisette server", FAIL, "Cannot reach %s" % url, str(exc),
+                       "Is the anisette container running? Check `docker ps`.")
+
+    with _anisette_lock:
+        cached = _anisette_cache.get(url)
+        if cached and time.monotonic() < cached[0]:
+            return cached[1]
+        result = _check_anisette_contract(url)
+        result["detail"] = (result["detail"] + " | " if result["detail"] else "") + \
+            "\"/\" fetched %s, next fetch in %ds" % (
+                time.strftime("%H:%M:%SZ", time.gmtime()), ANISETTE_CONTRACT_INTERVAL)
+        _anisette_cache[url] = (time.monotonic() + ANISETTE_CONTRACT_INTERVAL, result)
+        return result
+
+
+def _check_anisette_contract(url):
+    """Fetch anisette data and validate it against the client's actual contract."""
+    try:
         req = urllib.request.Request(url, headers={"User-Agent": "Xcode"})
         with urllib.request.urlopen(req, timeout=10) as resp:
             status = resp.status
             body = resp.read(65536).decode("utf-8", "replace")
+            fetched_at = time.time()
     except urllib.error.HTTPError as exc:
         return _result("Anisette server", FAIL, "HTTP %s from %s" % (exc.code, url),
                        "Server is reachable but unhealthy.",
@@ -135,44 +206,160 @@ def check_anisette(url=None):
         detail += " | client-info contains com.apple.dt.Xcode, so the built-in sanitizer is " \
                   "load-bearing (leave ALTSERVER_NO_CLIENTINFO_SANITIZE unset)"
 
+    changed = _identity_note(data)
+    if changed:
+        return _result("Anisette server", FAIL, "The anisette machine identity CHANGED",
+                       detail + " | " + changed,
+                       "Apple now sees a new machine: the next sign-in needs 2FA, which an "
+                       "unattended refresh cannot answer. Restore the anisette-config backup. If "
+                       "the change was intended, delete %s to accept it." % ANISETTE_IDENTITY_FILE)
+
     ok = _result("Anisette server", OK, "All 10 fields present, all strings, HTTP 200", detail)
     ok["anisette_time"] = data.get("X-Apple-I-Client-Time")
+    # Skew as measured WHEN FETCHED: this result is cached, so comparing its timestamp with the
+    # clock at some later poll would report the cache age as skew.
+    try:
+        ok["anisette_skew"] = calendar.timegm(
+            time.strptime(ok["anisette_time"][:19], "%Y-%m-%dT%H:%M:%S")) - fetched_at
+    except (TypeError, ValueError):
+        pass
     return ok
 
 
-def check_clock(anisette_time=None):
-    """Drift against the ANISETTE server's clock is what actually matters.
+CLOCK_TOLERANCE = 30
+
+# An INDEPENDENT time reference. The anisette timestamp cannot be one: anisette and this page run
+# on the same host, and containers have no CLOCK_REALTIME of their own, so the two always agree --
+# including when the host clock is hours off, which is the normal state of a Pi 4 (no RTC) after a
+# power cut until NTP succeeds. Default: the Debian mirror the host already uses for apt, so no new
+# party learns anything. Plain HTTP on purpose: an HTTPS probe would depend on the very thing it
+# measures (certificate validity is judged by the local clock). "off" disables it.
+CLOCK_REFERENCE_URL = os.environ.get("ALTSERVER_CLOCK_REFERENCE_URL",
+                                     "http://deb.debian.org/debian/")
+CLOCK_REFERENCE_INTERVAL = 15 * 60  # at most one HEAD per 15 min, however often the page polls
+CLOCK_REFERENCE_RETRY = 5 * 60
+_reference_lock = threading.Lock()
+_reference = {}  # url -> (monotonic expiry, reference wall time, its monotonic anchor, error)
+
+
+def _reference_offset(url=None):
+    """(seconds our clock is BEHIND the reference, None) or (None, why not). Cached.
+
+    The reference instant is anchored to CLOCK_MONOTONIC rather than stored as an offset from our
+    wall clock, so an NTP step after the probe shows up at the next poll, not 15 minutes later.
+    """
+    url = CLOCK_REFERENCE_URL if url is None else url
+    if not url or url.lower() == "off":
+        return None, "external reference disabled"
+    with _reference_lock:
+        entry = _reference.get(url)
+        if not entry or time.monotonic() >= entry[0]:
+            ref_wall = anchor = None
+            error = ""
+            try:
+                req = urllib.request.Request(url, method="HEAD",
+                                             headers={"User-Agent": "altserver-status"})
+                t0 = time.monotonic()
+                try:
+                    with urllib.request.urlopen(req, timeout=5) as resp:
+                        date = resp.headers.get("Date")
+                except urllib.error.HTTPError as exc:  # an error status still carries a Date
+                    date = exc.headers.get("Date")
+                t1 = time.monotonic()
+                if not date:
+                    raise ValueError("no Date header")
+                # Date has 1 s resolution and is truncated: the server's instant was in [D, D+1).
+                ref_wall = email.utils.parsedate_to_datetime(date).timestamp() + 0.5
+                anchor = (t0 + t1) / 2
+            except Exception as exc:
+                error = "%s: %s" % (url, exc)
+            entry = (time.monotonic() + (CLOCK_REFERENCE_INTERVAL if error == ""
+                                         else CLOCK_REFERENCE_RETRY), ref_wall, anchor, error)
+            _reference[url] = entry
+        _, ref_wall, anchor, error = entry
+    if ref_wall is None:
+        return None, error
+    return ref_wall + (time.monotonic() - anchor) - time.time(), None
+
+
+class _Timex(ctypes.Structure):
+    # Leading fields of struct timex (<sys/timex.h>); ctypes applies the C alignment. The kernel
+    # struct is 208 bytes on 64-bit, so the padding is generous.
+    _fields_ = [("modes", ctypes.c_uint), ("offset", ctypes.c_long), ("freq", ctypes.c_long),
+                ("maxerror", ctypes.c_long), ("esterror", ctypes.c_long),
+                ("status", ctypes.c_int), ("_rest", ctypes.c_byte * 512)]
+
+
+def _kernel_ntp_synced():
+    """True/False exactly as `timedatectl show -p NTPSynchronized` decides it, or None.
+
+    systemd-timedated's ntp_synced() is adjtimex() with modes=0 and maxerror < 16 s
+    (src/timedate/timedated.c). That reads the HOST kernel's clock-discipline state, needs no
+    capability, and Docker's default seccomp profile allows it -- so unlike timedatectl it works in
+    this container with no bind mount, no D-Bus and no systemd.
+    """
+    try:
+        tx = _Timex()
+        if ctypes.CDLL(None, use_errno=True).adjtimex(ctypes.byref(tx)) < 0:
+            return None
+        return tx.maxerror < 16000000
+    except Exception:
+        return None
+
+
+def check_clock(anisette_time=None, anisette_skew=None):
+    """Is the clock that stamps X-Apple-I-Client-Time right?
 
     Linux forwards the anisette server's X-Apple-I-Client-Time to Apple verbatim (macOS stamps
-    Date() locally instead), so NTP on the AltServer host proves nothing on its own. Comparing the
-    two directly measures the thing that breaks sign-in, and unlike timedatectl it works inside a
-    container.
-    """
-    if anisette_time:
-        try:
-            parsed = time.strptime(anisette_time[:19], "%Y-%m-%dT%H:%M:%S")
-            skew = abs(calendar.timegm(parsed) - time.time())
-            if skew <= 30:
-                return _result("Clock agreement", OK,
-                               "Anisette clock within %ds of ours" % int(skew),
-                               "Anisette said %s" % anisette_time)
-            return _result("Clock agreement", FAIL,
-                           "Anisette clock is %ds away from ours" % int(skew),
-                           "Anisette said %s" % anisette_time,
-                           "Apple sees the anisette server's timestamp verbatim. Skew surfaces as "
-                           "an opaque -36607 with nothing naming time as the cause. Fix NTP on "
-                           "whichever host runs anisette -- not just this one.")
-        except Exception:
-            pass
+    Date() locally instead). Three signals, strongest first:
 
-    rc, out = _run(["timedatectl", "show", "-p", "NTPSynchronized", "--value"])
-    if rc is None:
-        return _result("Clock agreement", UNKNOWN, "No anisette timestamp to compare against",
-                       "timedatectl is unavailable here, which is normal in a container.",
-                       "This resolves itself once the anisette check above succeeds.")
-    if out.strip() == "yes":
-        return _result("Clock agreement", OK, "NTP synchronised")
-    return _result("Clock agreement", WARN, "Clock is NOT NTP-synchronised")
+      1. Our clock vs an external reference: the only one that sees a host clock that is simply
+         wrong (no RTC + power cut + NTP not yet, or never, synced).
+      2. The kernel's NTP state: whether anything is disciplining the clock at all.
+      3. Anisette timestamp vs our clock: catches a TZ other than UTC in the anisette container (it
+         stamps LOCAL time and appends a literal "Z") or an anisette server on another host. On
+         one host it reads ~0 for a merely wrong clock, so it can never clear the host clock.
+    """
+    if anisette_skew is None and anisette_time:
+        try:
+            anisette_skew = calendar.timegm(
+                time.strptime(anisette_time[:19], "%Y-%m-%dT%H:%M:%S")) - time.time()
+        except (TypeError, ValueError):
+            pass
+    said = "Anisette said %s" % anisette_time if anisette_time else "No anisette timestamp"
+    offset, why = _reference_offset()
+    synced = _kernel_ntp_synced()
+    ntp = {True: "kernel reports NTP-synchronised", False: "kernel reports NOT NTP-synchronised",
+           None: "kernel NTP state unavailable"}[synced]
+    ref = ("reference %s says our clock is %+.0fs off" % (CLOCK_REFERENCE_URL, offset)
+           if offset is not None else "no external reference (%s)" % why)
+    detail = " | ".join([said, ref, ntp])
+
+    if offset is not None and abs(offset) > CLOCK_TOLERANCE:
+        return _result("Clock agreement", FAIL,
+                       "This host's clock is %ds %s real time" % (round(abs(offset)),
+                                                                   "behind" if offset > 0
+                                                                   else "ahead of"),
+                       detail,
+                       "Apple sees this clock via the anisette timestamp; skew surfaces as an "
+                       "opaque -36607. Check `timedatectl timesync-status` on the host: a Pi has "
+                       "no RTC, so after a power cut it runs on the last saved time until NTP "
+                       "(UDP 123) succeeds.")
+    if anisette_skew is not None and abs(anisette_skew) > CLOCK_TOLERANCE:
+        return _result("Clock agreement", FAIL,
+                       "Anisette clock is %ds away from ours" % round(abs(anisette_skew)), detail,
+                       "The anisette container must run with TZ=UTC (it stamps local time with a "
+                       "literal Z); if it runs on another host, fix NTP there too.")
+    if synced is False:
+        return _result("Clock agreement", WARN, "Clock is NOT NTP-synchronised", detail,
+                       "Nothing is disciplining the clock (e.g. just booted after a power cut, or "
+                       "NTP is blocked), so it drifts or keeps a stale restored time.")
+    if offset is None and synced is None:
+        return _result("Clock agreement", UNKNOWN, "No independent clock reference", detail,
+                       "Same-host anisette time cannot reveal a wrong host clock.")
+    return _result("Clock agreement", OK,
+                   "Within %ds of real time" % CLOCK_TOLERANCE if offset is not None
+                   else "NTP-synchronised (no external reference)", detail)
 
 
 # netmuxd's socket. Set by the stack; the default matches deploy/altserver-stack.yml.
@@ -349,7 +536,7 @@ def run_all(anisette_url=None):
     anisette = check_anisette(anisette_url)
 
     def _clock():
-        return check_clock(anisette.get("anisette_time"))
+        return check_clock(anisette.get("anisette_time"), anisette.get("anisette_skew"))
 
     rest = [_clock, check_device, check_phone_advertisement,
             check_advertisement, check_altserver_running]

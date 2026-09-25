@@ -65,6 +65,17 @@ services:
       # ...but then you must mkdir it and chown it to 1000:1000 first.
       - anisette-config:/home/Alcoholic/.config/anisette-v3
 
+    # Same probe as deploy/anisette-stack.yml: /v3/client_info is a static reply (no ADI, no Apple
+    # contact); never "/", which provisions against Apple on newer images. curl is in this digest
+    # (its second layer installs it). A Portainer signal only: plain Compose never restarts an
+    # unhealthy container, which is what we want here.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:6969/v3/client_info"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+
   # --------------------------------------------------------------------------------------------
   # AltServer itself.
   # --------------------------------------------------------------------------------------------
@@ -321,8 +332,15 @@ services:
       - anisette
 
     environment:
-      # The status page checks this endpoint against the client's actual contract.
+      # The status page checks this endpoint against the client's actual contract: liveness via
+      # /v3/client_info on every poll, the full "/" contract at most every N seconds.
       ALTSERVER_ANISETTE_SERVER: http://127.0.0.1:6969
+      ALTSERVER_ANISETTE_CHECK_INTERVAL: "600"
+      # Independent time reference for the clock check (one HEAD per 15 min, plain HTTP on
+      # purpose). The anisette timestamp cannot catch a wrong HOST clock: both containers read the
+      # same kernel clock. Default is the Debian mirror apt already uses; "off" disables it. The
+      # kernel's NTP state is read with adjtimex(), so no /run/systemd bind mount is needed.
+      ALTSERVER_CLOCK_REFERENCE_URL: "http://deb.debian.org/debian/"
       # Nothing here fetches the IPA; that is altserver's job.
       ALTSTORE_SKIP_FETCH: "1"
 

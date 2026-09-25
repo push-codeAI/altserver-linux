@@ -17,10 +17,11 @@
 
 services:
   anisette:
-    # Digest-pinned on purpose. ":latest" is the only tag published, and it is ~17
-    # months behind the git source because upstream's publish workflow keeps failing.
-    # Pinning means a surprise CI fix can never silently swap the binary that holds
-    # your Apple machine identity out from under a running deployment.
+    # Digest-pinned on purpose. This digest is upstream commit e0d527b (2025-04-13). Since
+    # 2026-09-23 ":latest" (also tagged 09-2026) is rebuilt on the 1st of EVERY month by a
+    # scheduled workflow, on whatever Debian stable is current, and no longer includes
+    # linux/arm/v7. Pinning means a monthly rebuild can never silently swap the binary that
+    # holds your Apple machine identity out from under a running deployment.
     # CHANGE ONLY IF: you decide to build from source into ghcr.io/ben-diehlci/ (see fallbacks).
     image: dadoum/anisette-v3-server@sha256:1e20384985d3c49965f444bef39d627768dacc39ea0dca91f2a535edb7591ba3
     container_name: anisette
@@ -59,18 +60,17 @@ services:
       - /opt/stacks/anisette/config:/home/Alcoholic/.config/anisette-v3
 
     healthcheck:
-      # Deliberately /v3/client_info and NOT "/". The v1 route at "/" performs REAL
+      # Deliberately /v3/client_info and NOT "/". In images built from upstream b76cd01
+      # (2026-04-04) on -- the current :latest -- the v1 route at "/" performs REAL
       # provisioning against Apple whenever the machine is not yet provisioned, so a
       # polling healthcheck on "/" would hammer Apple's endpoint at exactly the moment
-      # your identity volume has gone missing -- turning a restore-the-backup incident
-      # into rate-limit / account-lock territory. /v3/client_info is static and makes
-      # no Apple contact.
-      # CHANGE ONLY IF: the container reports "unhealthy" immediately. The April-2025
-      # image may not ship curl -- check with `docker exec anisette curl --version`.
-      # If curl is missing, just DELETE this entire healthcheck block. It is a
+      # your identity volume has gone missing. (The digest pinned above predates that: it
+      # provisions only at startup and EXITS if that fails, so restart: unless-stopped
+      # retries it on Docker's restart backoff instead.) /v3/client_info is static and
+      # makes no Apple contact. curl IS in this digest (layer 2 installs it). This is a
       # Portainer dashboard signal only; plain Compose never restarts an unhealthy
-      # container (that is Swarm), and auto-restarting into Apple provisioning would
-      # be the harmful loop described above.
+      # container (that is Swarm), and auto-restarting into Apple provisioning would be
+      # the harmful loop described above.
       test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:6969/v3/client_info"]
       interval: 5m
       timeout: 10s
