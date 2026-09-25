@@ -195,6 +195,10 @@ services:
     # which would be a worse first experience than a container with one LSM relaxed. seccomp,
     # namespaces and cgroups still apply either way, so this is still more confined than running
     # AltServer directly on the host -- the actual alternative.
+    #
+    # RASPBERRY PI OS: none of the above applies. Its kernels build AppArmor in but enable no LSM
+    # (bcm2711_defconfig: CONFIG_LSM=""), so Docker skips AppArmor entirely -- this line is
+    # ignored, D-Bus is never denied, and install.sh stops at its kernel check. Leave it as is.
     security_opt:
       - apparmor=${ALTSERVER_APPARMOR:-unconfined}
 
@@ -326,6 +330,10 @@ services:
     # which would be a worse first experience than a container with one LSM relaxed. seccomp,
     # namespaces and cgroups still apply either way, so this is still more confined than running
     # AltServer directly on the host -- the actual alternative.
+    #
+    # RASPBERRY PI OS: none of the above applies. Its kernels build AppArmor in but enable no LSM
+    # (bcm2711_defconfig: CONFIG_LSM=""), so Docker skips AppArmor entirely -- this line is
+    # ignored, D-Bus is never denied, and install.sh stops at its kernel check. Leave it as is.
     security_opt:
       - apparmor=${ALTSERVER_APPARMOR:-unconfined}
 

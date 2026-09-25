@@ -28,14 +28,15 @@ if [ ! -f "$SRC" ]; then
     exit 1
 fi
 
-if ! command -v apparmor_parser >/dev/null 2>&1; then
-    echo "apparmor_parser is not installed. On Debian/Ubuntu: apt install apparmor-utils" >&2
-    exit 1
-fi
-
 if [ ! -d /sys/kernel/security/apparmor ]; then
     echo "AppArmor is not enabled on this kernel. Nothing to do -- and nothing to work around:" >&2
     echo "without AppArmor the containers are not being denied D-Bus in the first place." >&2
+    echo "(Raspberry Pi OS kernels: CONFIG_LSM=\"\", so AppArmor is off unless cmdline.txt adds security=apparmor.)" >&2
+    exit 1
+fi
+
+if ! command -v apparmor_parser >/dev/null 2>&1; then
+    echo "apparmor_parser is not installed. On Debian/Ubuntu: apt install apparmor-utils" >&2
     exit 1
 fi
 
