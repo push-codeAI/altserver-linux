@@ -93,10 +93,14 @@ main_patched_root := $(BUILD_DIR)/AltServer_patched
 main_orifiles := $(wildcard $(main_srcroot)/*.*)
 main_newfiles := $(main_orifiles:$(main_srcroot)/%=$(main_patched_root)/%)
 
-$(main_patched_root)/%: $(main_srcroot)/%
+# The rewriter is a prerequisite of its own output: without it, editing a rewriter (adding a patch)
+# left every existing build directory "up to date", and the binary silently shipped without it.
+$(main_patched_root)/%: $(main_srcroot)/% $(ROOT_DIR)/makefiles/rewrite_altserver_source.py
 	mkdir -p `dirname "$@"`
 	python3 $(ROOT_DIR)/makefiles/rewrite_altserver_source.py "$<" > $@
 
+# Over-broad on purpose: there is no header dependency tracking (-MMD), so regenerating EVERY patched
+# file when any original changes is what makes objects that include a changed header recompile.
 $(main_newfiles) : $(main_orifiles)
 
 preprocess : $(main_newfiles)

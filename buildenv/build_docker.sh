@@ -12,11 +12,12 @@
 #   bash build_docker.sh                     # in CI: pushes to the repo owner's namespace
 #   GHCR_NAMESPACE=someone bash build_docker.sh
 #
-# NOTE: this only changes where images are PUBLISHED. Nothing consumes them from here yet --
-# .github/workflows/build.yml, build_image.yml, docker/Dockerfile, deploy/altserver-stack.yml and
-# README.md all still pull ghcr.io/nyamisty/altserver_builder_alpine_*, which are public, alive,
-# and what every build currently uses. Repointing those is a separate, deliberate step, and doing
-# it before this script has successfully published your own images would break the build outright.
+# NOTE: this only changes where images are PUBLISHED. Nothing consumes them: build.yml,
+# build_image.yml and docker/Dockerfile build inside ghcr.io/ben-diehlci/altserver_builder_alpine_*
+# PINNED BY DIGEST. A rebuild here is NOT a copy of those: it re-downloads corecrypto from Apple
+# and clones cpprestsdk (archived upstream 2026-05) and libzip master at whatever they are today,
+# on EOL Alpine 3.15, so it yields a different toolchain. To stop depending on another account,
+# mirror the pinned images instead (docker pull <image>@sha256:..., tag, push to your namespace).
 
 set -euo pipefail
 
@@ -48,9 +49,8 @@ build_and_push arm32v7/alpine:3.15 armv7
 build_and_push i386/alpine:3.15    i386
 
 echo
-echo "Done. To actually BUILD against these instead of ghcr.io/nyamisty, repoint:"
+echo "Done. To actually BUILD against these instead of the digest-pinned ben-diehlci images, repoint"
+echo "(by digest -- docker inspect --format '{{index .RepoDigests 0}}' <image>):"
 echo "  .github/workflows/build.yml       (the four matrix entries)"
-echo "  .github/workflows/build_image.yml (the BUILDER build-arg)"
-echo "  docker/Dockerfile                 (ARG BUILDER default)"
-echo "  deploy/altserver-stack.yml        (the commented build: BUILDER)"
+echo "  docker/Dockerfile                 (ARG BUILDER_AMD64 / BUILDER_ARM64)"
 echo "  README.md                         (the docker run example)"

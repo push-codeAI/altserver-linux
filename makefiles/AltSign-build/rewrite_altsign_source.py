@@ -131,6 +131,25 @@ if F.endswith('AppleAPI+Authentication.cpp'):
             sys.exit(1)
         content = content.replace(_old, _new)
 
+# --- Archiver.cpp uses std::vector without including <vector> ------------------------
+# UnzipAppBundle() builds a std::vector<char>, but the file never includes <vector>. It compiled
+# only because Alpine 3.15's libstdc++ 10 pulled <vector> in transitively. libstdc++ 13 and 14 do
+# not, and every newer toolchain (clang++ and g++ alike) fails with
+#     Archiver.cpp:284: error: no member named 'vector' in namespace 'std'
+# It is the only missing standard include in the build (all TUs checked with g++ 13/14 and clang 18).
+# Skipped if upstream ever adds the include itself; harmless on the old toolchain.
+_archiver_old = b'#include <fstream>\r\n'
+_archiver_new = b'#include <fstream>\r\n#include <vector>\r\n'
+
+if F.endswith('Archiver.cpp') and b'#include <vector>' not in content:
+    if content.count(_archiver_old) != 1:
+        sys.stderr.write(
+            "rewrite_altsign_source.py: <vector> include anchor matched %d times, expected 1.\n"
+            "  upstream Archiver.cpp changed; re-check whether it still needs <vector>.\n"
+            % content.count(_archiver_old))
+        sys.exit(1)
+    content = content.replace(_archiver_old, _archiver_new)
+
 content = content.replace(b'winsock2.h', b'WinSock2.h')
 
 sys.stdout.buffer.write(content)

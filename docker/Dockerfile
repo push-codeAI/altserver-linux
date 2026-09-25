@@ -31,8 +31,13 @@
 # The legacy (non-BuildKit) builder sets no TARGETARCH and falls back to amd64, as before.
 # netmuxd publishes Linux builds for x86_64 and aarch64 only, so those are the two stages.
 # ---------------------------------------------------------------------------------------------
-ARG BUILDER_AMD64=ghcr.io/ben-diehlci/altserver_builder_alpine_amd64
-ARG BUILDER_ARM64=ghcr.io/ben-diehlci/altserver_builder_alpine_aarch64
+#
+# Pinned BY DIGEST (the same digests as build.yml's matrix): the tags are another account's mutable
+# :latest, and these images ARE the compiler and the statically linked LibreSSL, cpprestsdk, libzip
+# and corecrypto of the shipped binary -- a re-push would change it with no commit here. Read from
+# ghcr.io on 2026-09-25; the arm64 one is exactly what the only CI build (2026-09-19) used.
+ARG BUILDER_AMD64=ghcr.io/ben-diehlci/altserver_builder_alpine_amd64@sha256:45b98a4b96f2f1d6c719b3b03f95b097f82d9daf114a14fa1adfe6f022e64c58
+ARG BUILDER_ARM64=ghcr.io/ben-diehlci/altserver_builder_alpine_aarch64@sha256:1c9ee63177026f729ca524aa3e7c7c02c695b656a34ace4115b6fd26464c6492
 ARG BUILDER=
 
 FROM ${BUILDER_AMD64} AS builder-amd64

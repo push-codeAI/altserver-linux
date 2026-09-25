@@ -416,9 +416,10 @@ to end up with a server that runs, reports nothing wrong, and is invisible to yo
   Raspberry Pi set `ALTSERVER_IMAGE` to your own account's image, or build locally (the Dockerfile
   picks the toolchain for the host's architecture) and point `ALTSERVER_IMAGE` at the tag:
   `docker build -f docker/Dockerfile -t altserver-linux:local .`
-- Static binaries: GitHub Actions artifacts. Branch pushes build **aarch64** only; tags build all
-  four architectures. **`chmod +x` after downloading** — artifact upload does not preserve the
-  executable bit. Artifacts expire after 90 days; keep a copy, or push a tag for a release
+- Static binaries: GitHub Actions artifacts, one `AltServer-<arch>.tar.gz` each (a tarball, so
+  the executable bit survives: `tar xzf AltServer-aarch64.tar.gz`). Branch pushes build **aarch64**
+  only; tags build all four architectures and attach them to a release. Artifacts expire after 90
+  days; keep a copy, or push a tag for a release
 
 ---
 
