@@ -300,9 +300,11 @@ of a dead deployment is an app that will not open, a week later.
   packages, not the vendored copy AltServer links. They were green throughout a bug that broke
   every wireless refresh. The only evidence that refresh works is AltServer's own log.
 - **A misleading error.** Real device faults are *displayed* as "AltServer could not be found",
-  because AltStore remaps them for any server that is not `isPreferred`, and this port hardcodes
-  serverID `"1234567"` where Mac and Windows use a UUID. It will send you to debug mDNS when mDNS
-  is fine.
+  because AltStore remaps them for any server that is not `isPreferred` -- and this port hardcodes
+  serverID `"1234567"` where Mac and Windows use a UUID, so only an AltStore that THIS server
+  installed (it writes that ID into AltStore's Info.plist) treats it as preferred. Otherwise it
+  will send you to debug mDNS when mDNS is fine. AltServer's log now names the device call that
+  failed (`[device] com.apple.misagent failed: lockdownd -27 (Invalid service)` and the like).
 - **`-d` makes things worse.** `libusbmuxd_set_debug_level(debugLogLevel - 2)` underflows, and a
   single `-d` silences the two messages that actually diagnose a netmuxd mismatch.
 - **Changing the Apple ID password kills unattended refresh.** A background refresh has no way to
@@ -314,6 +316,11 @@ of a dead deployment is an app that will not open, a week later.
   depend on. It happens whenever the install cannot find the cached key in
   `./AltServerData/Certificates/` -- so always run installs from the same working directory. Scripted
   installs should set `ALTSERVER_NONINTERACTIVE=1`, which refuses the revoke instead (exit 6).
+- **iOS 18 and later: an install keeps the other apps' profiles.** The 2022 code removed every
+  other free provisioning profile around each install with a free Apple ID and put them back
+  afterwards; upstream AltServer 1.7.2 stopped doing that on iOS 18+ because it leaves apps
+  "unverified", and so does this port now. The log says which path ran:
+  `Device iOS 27; keeping other free provisioning profiles during install`.
 - **AltStore's refresh removes profiles it does not know about.** On a free Apple ID, AltStore
   sends the list of apps in its own library, and the server removes every other free provisioning
   profile. An app installed with the CLI (not through AltStore) stops launching after AltStore's
@@ -355,6 +362,7 @@ retrying a sign-in in a loop is how Apple IDs get locked.
 | `ALTSERVER_NONINTERACTIVE` | Set to `1` for scripted installs (cron, systemd, a re-sign pipeline). Never waits on stdin, fails at once if Apple asks for a 2FA code, and refuses to revoke the signing certificate |
 | `ALTSERVER_ALLOW_REVOKE` | With `ALTSERVER_NONINTERACTIVE=1`, set to `1` to allow that revoke -- deliberately, once |
 | `ALTSERVER_2FA_TIMEOUT` | Web UI: seconds an unanswered 2FA prompt waits before the install is cancelled (default 600) |
+| `ALTSERVER_GSA_USER_AGENT` | Replaces the User-Agent of the Apple sign-in and 2FA requests (default: the 2019-era values that are proven here). Leave unset unless sign-in starts failing as an outdated client; upstream AltSign moved to `AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)` in September 2026 |
 | `ALTSERVER_WEB_ALLOWED_HOSTS` | Web UI: extra host names it may be reached by. IP addresses, single-label names and `.local` / `.lan` / `.home.arpa` / `.internal` names always work |
 
 There is deliberately **no default anisette server**. The one that used to be hardcoded has

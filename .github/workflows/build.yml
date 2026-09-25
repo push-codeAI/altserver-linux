@@ -122,6 +122,11 @@ jobs:
       - name: Healthchecks restart only after repeated failures, only via Docker's init
         run: python3 tests/check_healthcheck.py
 
+      # netmuxd matches the phone by its Bonjour TXT keys since iOS 26.4. If an iOS update changes
+      # them, netmuxd silently lists nothing while the page blamed the network.
+      - name: Status page shows the phone's TXT form and names a netmuxd/iOS mismatch
+        run: python3 tests/check_status_advert.py
+
   check:
     runs-on: ubuntu-latest
     name: "Check Upstream Updates"

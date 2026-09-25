@@ -698,6 +698,8 @@ if NAME == 'ClientConnection.cpp':
 
 
 if NAME == 'DeviceManager.cpp':
+    content = content.replace(b'\r', b'')
+
     # InstallApp and RemoveApp wait for installation_proxy's final status with an unbounded
     # cv.wait(). libimobiledevice's status thread returns WITHOUT calling back on a connection
     # error and polls forever on silence, so a phone that leaves Wi-Fi, drops off WireGuard or
@@ -740,6 +742,117 @@ if NAME == 'DeviceManager.cpp':
     content = replace_exact(content,
         b'if (std::string(statusName) == std::string("Complete") || errorCode != 0 || errorName != NULL)',
         b'if ((statusName != NULL && std::string(statusName) == std::string("Complete")) || errorCode != 0 || errorName != NULL)')
+
+
+    # (1) Name the step that failed. Every device-side failure in this file is thrown as a bare
+    # ServerError(ConnectionFailed) or (DeviceNotFound), and nothing is logged, so the journal
+    # only ever says "There was an error connecting to the device." -- whether the phone
+    # vanished from netmuxd, rejected the pairing record, refused TLS, or stopped offering
+    # misagent/installation_proxy/afc over lockdown. Those are exactly the ways an iOS update
+    # breaks this path, and each needs a different fix. The wrappers log the call and the
+    # libimobiledevice error, then return it unchanged, so control flow is untouched.
+    # Defined AFTER the libimobiledevice headers so the function-like macros cannot rewrite
+    # the prototypes; a macro's own name is not re-expanded inside its replacement.
+    content = replace_exact(content, b'#define DEVICE_LISTENING_SOCKET 28151\n', b'''#define DEVICE_LISTENING_SOCKET 28151
+
+/* --- AltServer-Linux: log which device call failed (rewrite_altserver_source.py) --- */
+template <typename E> static E altserver_trace(const char* call, E err)
+{
+	if ((int)err != 0) { std::cout << "[device] " << call << " failed: error " << (int)err << std::endl; }
+	return err;
+}
+static idevice_error_t altserver_trace(const char* call, idevice_error_t err)
+{
+	if (err != IDEVICE_E_SUCCESS) { std::cout << "[device] " << call << " failed: idevice " << (int)err << (err == IDEVICE_E_NO_DEVICE ? " (not listed by usbmuxd/netmuxd)" : "") << std::endl; }
+	return err;
+}
+static lockdownd_error_t altserver_trace(const char* call, lockdownd_error_t err)
+{
+	if (err != LOCKDOWN_E_SUCCESS) { std::cout << "[device] " << call << " failed: lockdownd " << (int)err << " (" << lockdownd_strerror(err) << ")" << std::endl; }
+	return err;
+}
+#define idevice_new_with_options(...) altserver_trace("idevice_new_with_options", idevice_new_with_options(__VA_ARGS__))
+#define lockdownd_client_new_with_handshake(...) altserver_trace("lockdownd_client_new_with_handshake", lockdownd_client_new_with_handshake(__VA_ARGS__))
+#define lockdownd_start_service(c, name, svc) altserver_trace(name, lockdownd_start_service(c, name, svc))
+#define misagent_client_new(...) altserver_trace("misagent_client_new", misagent_client_new(__VA_ARGS__))
+#define instproxy_client_new(...) altserver_trace("instproxy_client_new", instproxy_client_new(__VA_ARGS__))
+#define afc_client_new(...) altserver_trace("afc_client_new", afc_client_new(__VA_ARGS__))
+/* --- end AltServer-Linux --- */
+''')
+
+    # (2) iOS 18+: do not strip every free provisioning profile during an install. Port of
+    # upstream AltServer-Windows 5da5175 (1.7.2, 2024-09-04): "As of iOS 18, removing all
+    # provisioning profiles causes apps to become unverified." The pinned 2022 code removes ALL
+    # free profiles whenever the app being installed uses a free profile -- i.e. on every CLI
+    # re-sign with a free Apple ID -- then reinstalls the cached ones afterwards.
+    content = replace_exact(content, b'''			if (misagent_client_new(device, service, &mis) != MISAGENT_E_SUCCESS)
+			{
+				throw ServerError(ServerErrorCode::ConnectionFailed);
+			}
+
+
+			/* Connect to AFC service */''', b'''			if (misagent_client_new(device, service, &mis) != MISAGENT_E_SUCCESS)
+			{
+				throw ServerError(ServerErrorCode::ConnectionFailed);
+			}
+
+			/* Get iOS Version (AltServer-Linux: port of upstream 5da5175) */
+			OperatingSystemVersion osVersion(18, 0, 0);
+			{
+				plist_t device_version_plist = NULL;
+				char* device_version_string = NULL;
+				if (lockdownd_get_value(client, NULL, "ProductVersion", &device_version_plist) == LOCKDOWN_E_SUCCESS && device_version_plist != NULL)
+				{
+					plist_get_string_val(device_version_plist, &device_version_string);
+					if (device_version_string != NULL)
+					{
+						osVersion = OperatingSystemVersion(device_version_string);
+						free(device_version_string);
+					}
+					plist_free(device_version_plist);
+				}
+			}
+
+
+			/* Connect to AFC service */''')
+    content = replace_exact(content,
+        b'\t\t\tbool shouldManageProfiles = (activeProfiles.has_value() || (application->provisioningProfile() != NULL && application->provisioningProfile()->isFreeProvisioningProfile()));\n',
+        b'\t\t\t// As of iOS 18, removing all provisioning profiles causes apps to become unverified (upstream 5da5175).\n'
+        b'\t\t\tbool isAtLeastiOS18 = (osVersion.majorVersion >= 18);\n'
+        b'\t\t\tbool shouldManageProfiles = !isAtLeastiOS18 && (activeProfiles.has_value() || (application->provisioningProfile() != NULL && application->provisioningProfile()->isFreeProvisioningProfile()));\n'
+        b'\t\t\todslog("Device iOS " << osVersion.majorVersion << "; " << (shouldManageProfiles ? "removing" : "keeping") << " other free provisioning profiles during install");\n')
+
+if NAME == 'AltServerApp.cpp':
+    # AltStore 2.3 (build 64+) schedules its background refresh as a BGAppRefreshTask named
+    # "<bundle ID>.Refresh", and iOS only accepts identifiers listed in Info.plist's
+    # BGTaskSchedulerPermittedIdentifiers. Re-signing changes the bundle ID, so the list has to be
+    # rewritten too -- upstream does this in both AltServer and AltStore since 032c461 (2026-09-13).
+    # Without it, submit() fails with notPermitted inside the app and background refresh never runs.
+    content = replace_exact(content,
+        b'\t\tplist_dict_set_item(plist, "ALTBundleIdentifier", plist_new_string(app->bundleIdentifier().c_str()));\n',
+        b'''\t\tplist_dict_set_item(plist, "ALTBundleIdentifier", plist_new_string(app->bundleIdentifier().c_str()));
+
+		/* AltServer-Linux: BGTaskSchedulerPermittedIdentifiers must use the resigned bundle ID (upstream 032c461) */
+		plist_t bgTaskIDs = plist_dict_get_item(plist, "BGTaskSchedulerPermittedIdentifiers");
+		if (bgTaskIDs != nullptr && plist_get_node_type(bgTaskIDs) == PLIST_ARRAY)
+		{
+			std::string originalID = app->bundleIdentifier();
+			std::string resignedID = profile->bundleIdentifier();
+			for (uint32_t i = 0; i < plist_array_get_size(bgTaskIDs); i++)
+			{
+				char* raw = nullptr;
+				plist_get_string_val(plist_array_get_item(bgTaskIDs, i), &raw);
+				if (raw == nullptr) { continue; }
+				std::string value(raw);
+				free(raw);
+				for (size_t pos = 0; (pos = value.find(originalID, pos)) != std::string::npos; pos += resignedID.size())
+				{
+					value.replace(pos, originalID.size(), resignedID);
+				}
+				plist_set_string_val(plist_array_get_item(bgTaskIDs, i), value.c_str());
+			}
+		}
+''')
 
 
 # --- Post-conditions on the output -----------------------------------------------------------

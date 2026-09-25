@@ -26,6 +26,7 @@ import email.utils
 import hashlib
 import json
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -482,7 +483,17 @@ def check_phone_advertisement():
             "This advert is how a device offers itself for wireless access.")
 
     seen = sorted({"%s:%s" % (r[7], r[8]) for r in rows})
-    return _result("iPhone is advertising", OK, "Discoverable over mDNS", ", ".join(seen))
+    # The TXT KEYS are what netmuxd matches on (iOS 26.4+: identifier + authTag, HMAC'd with the
+    # pairing record's HostID). If a future iOS renames or adds keys, this line is where it shows.
+    keys = sorted({k for r in rows if len(r) > 9 for k in re.findall(r'"([^"=]+)=', r[9])})
+    detail = ", ".join(seen) + " | TXT keys: " + (", ".join(keys) or "none")
+    legacy_mac_name = any("@" in r[3] for r in rows)   # iOS < 26.4: "<MAC>@<ipv6>" instance name
+    if not ({"identifier", "authTag"} <= set(keys)) and not legacy_mac_name:
+        return _result("iPhone is advertising", WARN,
+                       "Advertising, but not in the TXT form netmuxd v0.4.3 matches", detail,
+                       "netmuxd matches identifier+authTag (iOS 26.4+) or a MAC in the instance "
+                       "name (older iOS). A different form means netmuxd may never list the phone.")
+    return _result("iPhone is advertising", OK, "Discoverable over mDNS", detail)
 
 
 def check_advertisement(service="_altserver._tcp"):
@@ -640,6 +651,17 @@ def run_all(anisette_url=None, deep=False):
                 results[i] = _result("Check #%d" % (i + 1), UNKNOWN,
                                      "This check raised an exception", str(exc))
 
+    # The one combination that points at netmuxd<->iOS drift rather than at the network: the phone
+    # IS advertising itself, yet netmuxd lists no device. netmuxd logs that only at debug level.
+    by_name = {c["name"]: c for c in results if c}
+    dev, adv = by_name.get("iPhone reachability"), by_name.get("iPhone is advertising")
+    if adv and dev and adv["state"] in (OK, WARN) and dev["state"] != OK \
+            and "Wi-Fi" not in (dev.get("summary") or ""):
+        dev["detail"] = ("%s | The phone advertises _apple-mobdev2._tcp but netmuxd lists nothing: "
+                         "netmuxd is not matching this iOS version's Bonjour record, or its lockdown "
+                         "heartbeat is failing. `docker logs netmuxd` (the stack runs it with "
+                         "RUST_LOG=netmuxd=info,netmuxd::mdns=debug): look for 'No paired device "
+                         "matched' / 'Failed to start lockdown session'." % (dev.get("detail") or ""))
     checks = [anisette] + results
     states = [c["state"] for c in checks]
     if FAIL in states:
