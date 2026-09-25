@@ -190,7 +190,7 @@ PAGE = """<!doctype html>
   </div>
 
   <footer>
-    Refreshes every 30s. Read-only &mdash; this page does not sign in or change anything.
+    Refreshes every 30s (checks are cached for up to 60s). Read-only &mdash; this page does not sign in or change anything.
     Raw JSON at <code>/api/status</code>.
   </footer>
 </div>
@@ -292,7 +292,7 @@ PAIRING_PAGE = PAIRING_PAGE[:PAIRING_PAGE.index("<body>")] + """<body>
     after this step refreshing happens over Wi-Fi and the cable is never needed again.
   </p>
   <div id="steps"></div>
-  <footer>Re-checks every 5s while you work. Run the commands shown on the server itself.</footer>
+  <footer>Re-checks every 5s while you work (every minute once paired). Run the commands shown on the server itself.</footer>
 </div>
 <script>
 function esc(s){ return String(s).replace(/[&<>\"']/g, c =>
@@ -301,6 +301,7 @@ const PILL = {ok:'ok', todo:'warn', blocked:'fail'};
 async function load(){
   try{
     const d = await (await fetch('/api/pairing',{cache:'no-store'})).json();
+    paired = !!d.paired;
     document.getElementById('when').textContent =
       d.paired ? 'Paired \u2713' : ('Next: ' + (d.next||''));
     document.getElementById('steps').innerHTML = d.steps.map((s,i) => `
@@ -322,7 +323,10 @@ async function load(){
 }
 // Only while the tab is visible: every poll makes anisette log the machine identity and
 // netmuxd print its device list, so a forgotten tab fills both logs around the clock.
-load(); setInterval(() => { if (!document.hidden) load(); }, 5000);
+let paired = false, lastLoad = 0;  // 5 s while pairing, 60 s once paired
+async function tick(){ if (document.hidden || Date.now() - lastLoad < (paired ? 60000 : 5000)) return;
+  lastLoad = Date.now(); await load(); }
+tick(); setInterval(tick, 5000);
 document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 </script>
 </body>
@@ -597,13 +601,31 @@ class Handler(BaseHTTPRequestHandler):
                         "why": "Could not read %s: %s" % (path_log, exc)}
             self._send(200, json.dumps(data), "application/json")
         elif path == "/api/status":
+            # Served from a short shared cache: ?refresh=1 forces a new run, ?deep=1 also
+            # re-validates the pairing against the phone (status_checks.cached_run_all).
+            query = self.path.partition("?")[2].split("&")
             try:
-                data = status_checks.run_all()
+                data = status_checks.cached_run_all(
+                    max_age=0 if "refresh=1" in query else None, deep="deep=1" in query)
             except Exception as exc:  # never let a check crash the dashboard
                 data = {"overall": "fail", "host": "", "checks": [{
                     "name": "Status service", "state": "fail",
                     "summary": "A check raised an exception", "detail": str(exc), "fix": ""}]}
             self._send(200, json.dumps(data), "application/json")
+        elif path == "/healthz":
+            # For external watchdogs (Uptime Kuma, `curl -fsS` from cron): poll as often as you
+            # like; it answers from the cache and runs the real checks at most once per
+            # ALTSERVER_HEALTHZ_MAX_AGE seconds. 503 exactly when the page would show a FAIL.
+            try:
+                data = status_checks.cached_run_all(
+                    max_age=float(os.environ.get("ALTSERVER_HEALTHZ_MAX_AGE", "300")))
+                failing = [c["name"] for c in data["checks"] if c["state"] == "fail"]
+                code, body = (503 if failing else 200), {
+                    "overall": data["overall"], "failing": failing, "age_s": data["age_s"]}
+            except Exception as exc:
+                code, body = 503, {"overall": "fail", "failing": ["Status service"],
+                                   "error": str(exc)}
+            self._send(code, json.dumps(body), "application/json")
         else:
             self._send(404, "not found\n", "text/plain; charset=utf-8")
 

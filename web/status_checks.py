@@ -399,7 +399,22 @@ def _devices_via(env, flag):
     return [l.strip() for l in out.splitlines() if l.strip()], ""
 
 
-def check_device():
+# `idevicepair validate` is the one check that reaches the PHONE: a TLS session to its lockdownd
+# over Wi-Fi, which wakes its radio. A GOOD result is reused this long; a bad one is re-checked on
+# every run, since someone is presumably fixing it and wants to see the change.
+PAIR_TTL = float(os.environ.get("ALTSERVER_STATUS_PAIR_TTL", "900"))
+_pair_ok_at = [0.0]
+
+
+def _validate_wireless_pairing(deep):
+    if not deep and time.monotonic() - _pair_ok_at[0] < PAIR_TTL and _pair_ok_at[0]:
+        return 0, "", int(time.monotonic() - _pair_ok_at[0])
+    rc, out = _run(["idevicepair", "-n", "validate"], env=_WIRELESS_ENV)
+    _pair_ok_at[0] = time.monotonic() if rc == 0 else 0.0
+    return rc, out, 0
+
+
+def check_device(deep=False):
     """Is the phone reachable, and -- the part that decides unattended refresh -- over WHICH path?
 
     Wireless is not a nicety here. Stock usbmuxd enumerates USB only, and on Ubuntu its unit is
@@ -414,10 +429,13 @@ def check_device():
         # -n is required here for the same reason as above: idevicepair.c:372 selects
         # IDEVICE_LOOKUP_USBMUX unless it is passed, so without it this validates a USB device
         # that does not exist on a cable-free server and reports a stale pairing record.
-        rc, out = _run(["idevicepair", "-n", "validate"], env=_WIRELESS_ENV)
+        rc, out, age = _validate_wireless_pairing(deep)
         if rc == 0:
             return _result("iPhone reachability", OK, "Reachable over Wi-Fi, pairing valid",
-                           "UDID %s via netmuxd%s" % (wireless[0], ", also on USB" if usb else ""))
+                           "UDID %s via netmuxd%s%s" % (
+                               wireless[0], ", also on USB" if usb else "",
+                               " (pairing validated %ds ago; /api/status?deep=1 re-checks)" % age
+                               if age else ""))
         if "passcode" in out.lower():
             return _result("iPhone reachability", WARN, "Found over Wi-Fi, but the device is locked",
                            out.strip(), "Unlock the phone and re-check.")
@@ -585,7 +603,7 @@ def check_last_refresh(path=None, now=None):
     return _result(name, OK, summary, detail)
 
 
-def run_all(anisette_url=None):
+def run_all(anisette_url=None, deep=False):
     """Run every check, in parallel apart from the one real dependency.
 
     These were serial, which made the page as slow as the SUM of its checks. Two of them shell out
@@ -605,7 +623,10 @@ def run_all(anisette_url=None):
     def _clock():
         return check_clock(anisette.get("anisette_time"), anisette.get("anisette_skew"))
 
-    rest = [_clock, check_device, check_phone_advertisement,
+    def _device():
+        return check_device(deep)
+
+    rest = [_clock, _device, check_phone_advertisement,
             check_advertisement, check_altserver_running, check_last_refresh]
 
     results = [None] * len(rest)
@@ -628,6 +649,30 @@ def run_all(anisette_url=None):
     else:
         overall = OK
     return {"overall": overall, "checks": checks, "host": socket.gethostname()}
+
+
+# A full run is ~6 subprocesses (2x avahi-browse, 2x idevice_id, idevicepair, pgrep) plus HTTP to
+# anisette, and the status tab, a forgotten second tab and any external watchdog each triggered
+# their own. Share one result for this long; callers arriving while a run is in flight wait for
+# it instead of starting another, so N pollers cost the same as one.
+CACHE_TTL = float(os.environ.get("ALTSERVER_STATUS_TTL", "60"))
+_cache_lock = threading.Lock()
+_cache = {"at": None, "data": None, "deep": False}
+
+
+def cached_run_all(max_age=None, deep=False):
+    """run_all() at most once per `max_age` s (default CACHE_TTL); max_age=0 forces a new run --
+    though a run that FINISHED after this call started is always fresh enough."""
+    asked = time.monotonic()
+    max_age = CACHE_TTL if max_age is None else max_age
+    with _cache_lock:
+        at, data = _cache["at"], _cache["data"]
+        if data is not None and (_cache["deep"] or not deep) and (
+                at >= asked or time.monotonic() - at < max_age):
+            return dict(data, age_s=int(time.monotonic() - at))
+        data = run_all(deep=deep)
+        _cache.update(at=time.monotonic(), data=data, deep=deep)
+        return dict(data, age_s=0)
 
 
 if __name__ == "__main__":
