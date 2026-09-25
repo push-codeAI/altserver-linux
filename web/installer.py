@@ -117,6 +117,7 @@ class Installer:
         self.started_at = None
         self._proc = None
         self._abort_reason = None
+        self._on_device_since = None
         self._generation += 1
 
     def _emit(self, text):
@@ -180,6 +181,14 @@ class Installer:
                 line = raw.rstrip("\n")
                 self._emit(line)
 
+                if "Finished writing to device." in line:
+                    # Next, AltServer removes EVERY free provisioning profile from the phone and
+                    # only puts the others back once installd reports completion (DeviceManager
+                    # InstallApp). Killing it in between leaves AltStore and every other
+                    # sideloaded app unable to launch until each is re-signed.
+                    with self._lock:
+                        self._on_device_since = time.time()
+
                 if PROMPT_2FA in line:
                     with self._lock:
                         self.state = AWAITING_2FA
@@ -207,8 +216,9 @@ class Installer:
             if self._abort_reason:
                 self.state = FAILED
                 self.error = self._abort_reason
-            # AltServer exits 0 even on failure (it catches, logs, prints "Finished!" and falls off
-            # the end of main), so the exit code is not trustworthy -- read the output instead.
+            # Builds before the exit-status fix exited 0 even on failure (they caught, logged,
+            # printed "Finished!" and fell off the end of main), and an image may still carry one --
+            # so read the output first and use the exit code only as the fallback.
             elif "Installation Succeeded" in text or "Installed app" in text:
                 self.state = SUCCEEDED
             elif re.search(r"Could not install|Error:|error code", text, re.IGNORECASE):
@@ -256,6 +266,12 @@ class Installer:
         with self._lock:
             if self.state not in (RUNNING, AWAITING_2FA):
                 return False, "Nothing to cancel."
+            # Refuse while the phone is mid-install, but not forever: a device lost mid-install
+            # hangs AltServer indefinitely (installd's final status never arrives).
+            if self._on_device_since and time.time() - self._on_device_since < 600:
+                return False, ("AltServer is installing on the phone and has temporarily removed the "
+                               "other apps' provisioning profiles; stopping it now would leave them "
+                               "unable to launch. Wait for it to finish (or retry in 10 minutes).")
             proc = self._proc
             self._abort_reason = "Install cancelled."
         if proc and proc.poll() is None:

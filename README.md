@@ -308,7 +308,13 @@ of a dead deployment is an app that will not open, a week later.
   separate copies — updating Portainer alone is not enough.
 - **Do not casually re-run the one-shot install.** The revoke-confirmation prompt is compiled out
   on Linux, so a revoke proceeds unattended and invalidates the certificate your installed apps
-  depend on.
+  depend on. It happens whenever the install cannot find the cached key in
+  `./AltServerData/Certificates/` -- so always run installs from the same working directory. Scripted
+  installs should set `ALTSERVER_NONINTERACTIVE=1`, which refuses the revoke instead (exit 6).
+- **AltStore's refresh removes profiles it does not know about.** On a free Apple ID, AltStore
+  sends the list of apps in its own library, and the server removes every other free provisioning
+  profile. An app installed with the CLI (not through AltStore) stops launching after AltStore's
+  next refresh, until it is installed again.
 
 ---
 
@@ -328,6 +334,13 @@ Usage:  AltServer-Linux options [ ipa-file ]
 No IPA argument starts the daemon. With one, it performs a one-time install — which needs a real
 terminal, because the 2FA code is read from stdin.
 
+An install's exit status says how it ended, so a script can tell a retry from a problem that needs
+a person: `0` installed, `1` other failure, `2` Apple needs a human (2FA code, password), `3`
+anisette server, `4` device unreachable, `5` free-account limit (3 apps, 10 App IDs per 7 days),
+`6` refused to revoke the certificate, `7` another install is running (one install at a time per
+`./AltServerData`, enforced with a lock). Retry 3, 4 and 7 later; stop and look at 2, 5 and 6 --
+retrying a sign-in in a loop is how Apple IDs get locked.
+
 ### Environment
 
 | Variable | Purpose |
@@ -336,6 +349,10 @@ terminal, because the 2FA code is read from stdin.
 | `ALTSERVER_UDID` / `ALTSERVER_APPLE_ID` / `ALTSERVER_APPLE_PASSWORD` | Alternatives to `-u` / `-a` / `-p`. Prefer these: a password passed as `-p` is visible in `ps` to every user on the host |
 | `ALTSERVER_NO_CLIENTINFO_SANITIZE` | Set to `1` to stop rewriting `com.apple.dt.Xcode` in `X-MMe-Client-Info`. Diagnostic only — leave unset |
 | `ALTSTORE_SKIP_FETCH` | Set to `1` to stop the container refreshing `AltStore.ipa` on start |
+| `ALTSERVER_NONINTERACTIVE` | Set to `1` for scripted installs (cron, systemd, a re-sign pipeline). Never waits on stdin, fails at once if Apple asks for a 2FA code, and refuses to revoke the signing certificate |
+| `ALTSERVER_ALLOW_REVOKE` | With `ALTSERVER_NONINTERACTIVE=1`, set to `1` to allow that revoke -- deliberately, once |
+| `ALTSERVER_2FA_TIMEOUT` | Web UI: seconds an unanswered 2FA prompt waits before the install is cancelled (default 600) |
+| `ALTSERVER_WEB_ALLOWED_HOSTS` | Web UI: extra host names it may be reached by. IP addresses, single-label names and `.local` / `.lan` / `.home.arpa` / `.internal` names always work |
 
 There is deliberately **no default anisette server**. The one that used to be hardcoded has
 returned HTTP 502 since 2026-09, and pointing every user at a single shared anisette identity can

@@ -95,6 +95,24 @@ if F.endswith('AppleAPI+Authentication.cpp'):
         sys.exit(1)
     content = content.replace(_auth_old, _auth_new)
 
+# --- Initialise PKCS12_parse()'s out-parameters -------------------------------------------
+# Certificate(p12Data, password) declares `EVP_PKEY* key; X509* certificate;` uninitialised and
+# relies on PKCS12_parse() to null them. LibreSSL 3.4 (the Alpine 3.15 build) returns early for a
+# NULL PKCS12 -- an empty or truncated ./AltServerData/Certificates/<team>.p12, e.g. after power is
+# lost just after the cache was written -- WITHOUT nulling them, so the nullptr check that follows
+# reads stack garbage. (OpenSSL 3 nulls them first; the dynamic test build does not show this.)
+_p12_old = b'\tEVP_PKEY* key;\r\n\tX509* certificate;\r\n'
+_p12_new = b'\tEVP_PKEY* key = nullptr;\r\n\tX509* certificate = nullptr;\r\n'
+
+if F.endswith('/Certificate.cpp') or F == 'Certificate.cpp':
+    if content.count(_p12_old) != 1:
+        sys.stderr.write(
+            "rewrite_altsign_source.py: PKCS12 out-parameter patch matched %d times, expected 1.\n"
+            "  upstream Certificate.cpp changed; re-check before removing this guard.\n"
+            % content.count(_p12_old))
+        sys.exit(1)
+    content = content.replace(_p12_old, _p12_new)
+
 content = content.replace(b'winsock2.h', b'WinSock2.h')
 
 sys.stdout.buffer.write(content)

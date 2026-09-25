@@ -21,8 +21,81 @@
 #include "Error.hpp"
 
 #include "AltServerApp.h"
+#include "ServerError.hpp"
+
+#include <sys/file.h>
+#include <sys/stat.h>
+#include <fcntl.h>
+#include <errno.h>
 
 #define odslog(msg) { std::stringstream ss; ss << msg << std::endl; OutputDebugStringA(ss.str().c_str()); }
+
+// Exit status of an install. It used to be 0 for every outcome -- main() caught the error, logged
+// it and fell off the end -- so a scripted re-sign that failed was indistinguishable from one that
+// worked. The codes separate "retry later" (3, 4, 7) from "needs a human" (2, 5, 6).
+enum InstallExitCode
+{
+	InstallExitFailed = 1,           // anything not listed below (and usage errors, as before)
+	InstallExitNeedsSignIn = 2,      // 2FA required / wrong code / wrong password
+	InstallExitAnisette = 3,         // anisette server unreachable or returned unusable data
+	InstallExitDevice = 4,           // device not found / connection failed or lost
+	InstallExitFreeLimit = 5,        // 3 active sideloaded apps, or 10 App IDs per 7 days
+	InstallExitWouldRevoke = 6,      // refused to revoke the signing certificate unattended
+	InstallExitBusy = 7,             // another install holds ./AltServerData/.install.lock
+};
+
+static int InstallExitStatus(Error& error)
+{
+	if (auto apiError = dynamic_cast<APIError*>(&error))
+	{
+		switch ((APIErrorCode)apiError->code())
+		{
+		case APIErrorCode::IncorrectCredentials:
+		case APIErrorCode::AppSpecificPasswordRequired:
+		case APIErrorCode::RequiresTwoFactorAuthentication:
+		case APIErrorCode::IncorrectVerificationCode:
+		case APIErrorCode::AuthenticationHandshakeFailed:
+			return InstallExitNeedsSignIn;
+		case APIErrorCode::InvalidAnisetteData:
+			return InstallExitAnisette;
+		default:
+			return InstallExitFailed;
+		}
+	}
+
+	if (auto serverError = dynamic_cast<ServerError*>(&error))
+	{
+		switch ((ServerErrorCode)serverError->code())
+		{
+		case ServerErrorCode::InvalidAnisetteData:
+			return InstallExitAnisette;
+		case ServerErrorCode::DeviceNotFound:
+		case ServerErrorCode::ConnectionFailed:
+		case ServerErrorCode::LostConnection:
+			return InstallExitDevice;
+		case ServerErrorCode::MaximumFreeAppLimitReached:
+			return InstallExitFreeLimit;
+		default:
+			return InstallExitFailed;
+		}
+	}
+
+	// The C++ AltSign has no case for Apple's App ID limit, so it arrives as a LocalizedError
+	// carrying Apple's own result code. 9120 is the code upstream AltSign (ALTAppleAPI.m) maps to
+	// ALTAppleAPIErrorMaximumAppIDLimitReached.
+	if (dynamic_cast<LocalizedError*>(&error) && error.code() == 9120)
+	{
+		return InstallExitFreeLimit;
+	}
+
+	// Raised by the certificate guard spliced in by rewrite_altserver_source.py.
+	if (error.domain() == "com.rileytestut.AltServer.Unattended")
+	{
+		return InstallExitWouldRevoke;
+	}
+
+	return InstallExitFailed;
+}
 
 #include <pplx/pplxtasks.h>
 #include <pplx/threadpool.h>
@@ -97,6 +170,13 @@ void print_help() {
 			"          failures; leave unset normally.\n"
 			"  - ALTSERVER_NO_SUBSCRIBE: set to skip usbmuxd_subscribe and poll the device list instead.\n"
 			"          For mux implementations that do not report attach events correctly.\n"
+			"  - ALTSERVER_NONINTERACTIVE: set to 1 for scripted installs (cron, systemd, a pipeline).\n"
+			"          Never waits on stdin; fails at once if Apple asks for a two-factor code; and\n"
+			"          refuses to revoke the signing certificate unless ALTSERVER_ALLOW_REVOKE=1.\n"
+			"\n"
+			"Install exit status: 0 installed, 1 other failure, 2 Apple sign-in needs a human (2FA,\n"
+			"password), 3 anisette server, 4 device unreachable, 5 free-account limit (3 apps /\n"
+			"10 App IDs per 7 days), 6 refused to revoke the certificate, 7 another install running.\n"
 			);
 }
 
@@ -263,10 +343,29 @@ int main(int argc, char *argv[]) {
 	}
 
 	if (installApp) {
+		// One install at a time per AltServerData. Two installs against one Apple ID race on the
+		// certificate (each can revoke the other's) and on the phone's provisioning profiles (each
+		// removes them all while it installs). The lock sits next to the cached certificate it
+		// protects, so it is shared by exactly the processes that share that certificate.
+		// Held until exit; the kernel releases it however the process ends.
+		int lockFD = -1;
+		if (mkdir("AltServerData", 0700) == 0 || errno == EEXIST)
+		{
+			lockFD = open("AltServerData/.install.lock", O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+		}
+		if (lockFD < 0 || flock(lockFD, LOCK_EX | LOCK_NB) != 0)
+		{
+			bool busy = (lockFD >= 0 && errno == EWOULDBLOCK);
+			fprintf(stderr, "ERROR: %s ./AltServerData/.install.lock: %s\n",
+				busy ? "another AltServer install is running; it holds" : "could not create", strerror(errno));
+			return busy ? InstallExitBusy : InstallExitFailed;
+		}
+
 		odslog("Installing app...");
 		std::shared_ptr<Device> _selectedDevice = std::make_shared<Device>("unknown", udid, Device::Type::All);;
 		std::optional<std::string> _ipaFilepath = std::make_optional<std::string>(ipaPath);
 		auto task = AltServerApp::instance()->InstallApplication(_ipaFilepath, _selectedDevice, (appleID), (password));
+		int status = 0;
 		try
 		{
 			task.get();
@@ -274,14 +373,22 @@ int main(int argc, char *argv[]) {
 		catch (Error& error)
 		{
 			odslog("Error: " << error.domain() << " (" << error.code() << ").")
+			status = InstallExitStatus(error);
+
+			if (dynamic_cast<APIError*>(&error) && (APIErrorCode)error.code() == APIErrorCode::RequiresTwoFactorAuthentication)
+			{
+				odslog("Apple asked for a two-factor code. Sign in once interactively (terminal or web UI) with the same anisette server, then re-run.");
+			}
 		}
 		catch (std::exception& exception)
 		{
 			odslog("Exception: " << exception.what());
 			odslog(boost::stacktrace::stacktrace());
+			status = InstallExitFailed;
 		}
 
 		odslog("Finished!");
+		return status;
 	} else {
 		AltServerApp::instance()->Start(0, 0);
 		while (1) {

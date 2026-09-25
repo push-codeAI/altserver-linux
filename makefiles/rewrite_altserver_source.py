@@ -125,7 +125,77 @@ void observe_all_exceptions(InIt first, InIt last)
 {
 	// TODO: FIX THIS
 }
+
+#include <sys/stat.h>
+#include <cstring>
+
+// ALTSERVER_NONINTERACTIVE=1 marks a scripted install (cron, systemd, a re-sign pipeline). It must
+// never wait on stdin, and must not take the destructive decision upstream leaves to a person.
+static bool AltServerNonInteractive()
+{
+	const char *value = getenv("ALTSERVER_NONINTERACTIVE");
+	return value != NULL && *value != '\0' && strcmp(value, "0") != 0;
+}
+
+// Whether a two-factor code can arrive on stdin at all. Not when unattended, and not when stdin
+// is /dev/null or closed (systemd, cron, `docker exec` without -i): there `std::cin >>` returns ""
+// at once and AltSign submits that empty code to Apple -- after asking Apple to push a sign-in
+// prompt to every trusted device. A pipe or a terminal may still deliver one (the web UI does).
+static bool AltServerCanReadVerificationCode()
+{
+	if (AltServerNonInteractive())
+	{
+		return false;
+	}
+
+	struct stat input, devNull;
+	if (fstat(STDIN_FILENO, &input) != 0)
+	{
+		return false;
+	}
+
+	return !(S_ISCHR(input.st_mode) && stat("/dev/null", &devNull) == 0 && input.st_rdev == devNull.st_rdev);
+}
+
+class UnattendedError : public Error
+{
+public:
+	UnattendedError(std::string message) : Error(1, { { NSLocalizedDescriptionKey, message } })
+	{
+	}
+
+	virtual std::string domain() const
+	{
+		return "com.rileytestut.AltServer.Unattended";
+	}
+};
+
+// Revoking the development certificate stops every app signed with it from launching -- AltStore
+// included -- until each is re-signed. Upstream asks first; MessageBox above answers yes by itself,
+// and certificates not named "AltStore..." are revoked without even that.
+static void AltServerCheckRevokeAllowed(std::shared_ptr<Certificate> certificate)
+{
+	const char *allow = getenv("ALTSERVER_ALLOW_REVOKE");
+	if (!AltServerNonInteractive() || (allow != NULL && strcmp(allow, "1") == 0))
+	{
+		return;
+	}
+
+	throw UnattendedError("Refusing to revoke development certificate \"" + certificate->machineName().value_or("?") +
+		"\" (serial " + certificate->serialNumber() + ") in an unattended run: every app signed with it would stop "
+		"launching. ./AltServerData/Certificates/ in the working directory holds no usable key for it -- the run "
+		"started somewhere else than before, or another tool (AltStore on the phone, another AltServer) replaced "
+		"the certificate. Run from the directory that holds the key, or set ALTSERVER_ALLOW_REVOKE=1 once, deliberately.");
+}
 ''')
+
+    # Every revocation goes through this line: the "AltStore..." certificate whose key is not cached
+    # here, or certificates[0] when none is named "AltStore...".
+    content = replace_exact(
+        content,
+        b'auto certificate = (preferredCertificate != nullptr) ? preferredCertificate : certificates[0];\n',
+        b'auto certificate = (preferredCertificate != nullptr) ? preferredCertificate : certificates[0];\n'
+        b'                  AltServerCheckRevokeAllowed(certificate);\n')
 
     content = insertBefore(content, b'fs::path AltServerApp::certificatesDirectoryPath', br'''
 HWND AltServerApp::windowHandle() const
@@ -162,7 +232,12 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 		return pplx::create_task([=]() -> std::optional<std::string> {
 			std::cout << "Enter two factor code" << std::endl;
 			std::string _verificationCode = "";
-			std::cin >> _verificationCode;
+			// A pipe at EOF leaves the string empty. Returning no code makes AltSign throw
+			// RequiresTwoFactorAuthentication rather than submit "" to Apple as the code.
+			if (!(std::cin >> _verificationCode) || _verificationCode.empty())
+			{
+				return std::nullopt;
+			}
 			auto verificationCode = std::make_optional<std::string>(_verificationCode);
 			_verificationCode = "";
 
@@ -170,13 +245,21 @@ pplx::task<std::pair<std::shared_ptr<Account>, std::shared_ptr<AppleAPISession>>
 		});
 	};
 
+	// Without a handler AltSign throws RequiresTwoFactorAuthentication as soon as Apple asks for a
+	// code, before requesting the push to trusted devices (AppleAPI+Authentication.cpp).
+	std::optional<std::function<pplx::task<std::optional<std::string>>(void)>> handler = std::nullopt;
+	if (AltServerCanReadVerificationCode())
+	{
+		handler = verificationHandler;
+	}
+
 	return pplx::create_task([=]() {
 		if (anisetteData == NULL)
 		{
 			throw ServerError(ServerErrorCode::InvalidAnisetteData);
 		}
 
-		return AppleAPI::getInstance()->Authenticate(appleID, password, anisetteData, verificationHandler);
+		return AppleAPI::getInstance()->Authenticate(appleID, password, anisetteData, handler);
 	});
 }
 
@@ -195,6 +278,11 @@ extern "C" int getchar();
 void AltServerApp::ShowAlert(std::string title, std::string message)
 {
 	std::cout << "Alert: " << title << std::endl << "    " << message << std::endl;
+	if (AltServerNonInteractive())
+	{
+		// A supervisor holding stdin open as a pipe would otherwise block here forever.
+		return;
+	}
 	std::cout << "Press any key to continue..." << std::endl;
 	//char a;
 	//std::cin >> a;
