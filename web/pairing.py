@@ -23,6 +23,7 @@ cases apart and say which one you are in.
 import os
 import re
 import shutil
+import stat
 import subprocess
 
 STEP_OK, STEP_TODO, STEP_BLOCKED = "ok", "todo", "blocked"
@@ -31,6 +32,22 @@ STEP_OK, STEP_TODO, STEP_BLOCKED = "ok", "todo", "blocked"
 # netmuxd's socket, matching deploy/altserver-stack.yml. Same variable status_checks.py uses.
 NETMUXD_SOCKET = os.environ.get("ALTSERVER_NETMUXD_SOCKET", "/run/muxd/usbmuxd")
 _WIRELESS_ENV = {"USBMUXD_SOCKET_ADDRESS": "UNIX:" + NETMUXD_SOCKET}
+# The host usbmuxd's socket (libusbmuxd's compiled-in default). Overridable for tests.
+USBMUXD_SOCKET = os.environ.get("ALTSERVER_USBMUXD_SOCKET", "/var/run/usbmuxd")
+
+
+def _path_kind(path):
+    """'socket', 'missing', 'directory' or 'other'. os.path.exists() cannot tell a live socket from
+    the empty DIRECTORY Docker creates when a bind-mounted host path is missing at container start."""
+    try:
+        mode = os.stat(path).st_mode
+    except FileNotFoundError:
+        return "missing"
+    except OSError:
+        return "other"
+    if stat.S_ISSOCK(mode):
+        return "socket"
+    return "directory" if stat.S_ISDIR(mode) else "other"
 
 
 def _run(cmd, timeout=15, env=None):
@@ -94,10 +111,60 @@ def diagnose():
                   "detail": "idevice_id and idevicepair are available", "action": "", "note": ""})
 
     # --- 2. is usbmuxd actually listening? ---------------------------------------------------
-    sock = "/var/run/usbmuxd"
-    if os.path.exists(sock):
+    sock = USBMUXD_SOCKET
+    kind = _path_kind(sock)
+    if kind == "socket":
         steps.append({"title": "usbmuxd socket present", "state": STEP_OK,
                       "detail": sock, "action": "", "note": ""})
+    elif kind == "directory":
+        # Docker made this: a bind mount of a host path that did not exist when the container
+        # started (usbmuxd is udev-activated, so after a boot with no cable it never does) is
+        # created as an empty DIRECTORY. The host usbmuxd then dies on every start with
+        # "unlink(/var/run/usbmuxd) failed: Is a directory", and a container created earlier
+        # against the socket no longer starts ("not a directory" mount error).
+        steps.append({
+            "title": "%s is a directory, not a socket" % sock,
+            "state": STEP_BLOCKED,
+            "detail": "Docker created it for a bind mount while usbmuxd was not running. The "
+                      "host's usbmuxd cannot start until it is removed, so a USB cable does "
+                      "nothing.",
+            "action": "On the host: delete the /var/run/usbmuxd lines from the stack, run "
+                      "`docker compose up -d --force-recreate`, then `sudo rmdir /run/usbmuxd` "
+                      "and replug the iPhone",
+            "note": "Wi-Fi refresh does not use this socket (it goes through netmuxd), so an "
+                    "already-paired phone keeps working. Only a USB pairing needs it.",
+        })
+        return {"steps": steps, "udids": [], "paired": False, "next": steps[-1]["title"]}
+    elif kind == "other":
+        steps.append({
+            "title": "%s is not a socket" % sock,
+            "state": STEP_BLOCKED,
+            "detail": "Something other than usbmuxd created this path.",
+            "action": "On the HOST: sudo rm %s, then replug the iPhone" % sock,
+            "note": "",
+        })
+        return {"steps": steps, "udids": [], "paired": False, "next": steps[-1]["title"]}
+    elif _path_kind(NETMUXD_SOCKET) == "socket":
+        # No cable mux, but netmuxd is up: normal for a paired phone on Wi-Fi. Carry on to the
+        # device check instead of stopping here -- that stop reported "usbmuxd is not running"
+        # for a setup whose wireless path was fine.
+        steps.append({"title": "No USB mux (normal without a cable)", "state": STEP_OK,
+                      "detail": "%s is absent; checking Wi-Fi via netmuxd (%s)"
+                                % (sock, NETMUXD_SOCKET),
+                      "action": "",
+                      "note": "A first-time pairing needs the cable: plug the iPhone into the "
+                              "HOST and run `idevicepair pair` there."})
+    elif _in_container():
+        steps.append({
+            "title": "No device mux reachable",
+            "state": STEP_BLOCKED,
+            "detail": "Neither %s (host usbmuxd, cable) nor %s (netmuxd, Wi-Fi) exists here."
+                      % (sock, NETMUXD_SOCKET),
+            "action": "docker compose ps netmuxd; docker logs --tail 50 netmuxd",
+            "note": "netmuxd serves the Wi-Fi path through the shared muxd-socket volume. A "
+                    "first-time pairing is done with the cable on the HOST (`idevicepair pair`).",
+        })
+        return {"steps": steps, "udids": [], "paired": False, "next": steps[-1]["title"]}
     else:
         steps.append({
             "title": "usbmuxd is not running",
@@ -107,9 +174,7 @@ def diagnose():
             "note": "Older guidance says to stop usbmuxd because netmuxd takes this same "
                     "socket. That is NOT true of this stack: netmuxd is given its own "
                     "--socket-path in a shared volume, so the host usbmuxd keeps the cable "
-                    "and nothing contends. Leave usbmuxd alone."
-                    + (" This container needs the socket bind-mounted from the host."
-                       if _in_container() else ""),
+                    "and nothing contends. Leave usbmuxd alone.",
         })
         return {"steps": steps, "udids": [], "paired": False, "next": steps[-1]["title"]}
 

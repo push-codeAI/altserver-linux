@@ -590,6 +590,10 @@ static std::mutex connectionsLock;
             {
                 int acceptError = errno;
                 std::cout << "Failed to accept connection: " << strerror(acceptError) << std::endl;
+                if (acceptError == EMFILE || acceptError == ENFILE)
+                {
+                    _exit(1); // descriptors exhausted: a restart frees leaked ones, waiting may not
+                }
                 std::this_thread::sleep_for(std::chrono::seconds(1));
                 continue;
             }
@@ -598,6 +602,19 @@ static std::mutex connectionsLock;
     # A backlog of 0 queues one pending connection: simultaneous connects have their SYN or final
     # ACK dropped and wait for a retransmit (1 s, then 2, 4 ...).
     content = replace_exact(content, b'if (listen(socket4, 0) != 0)', b'if (listen(socket4, SOMAXCONN) != 0)')
+
+    # LIVENESS. Listen() runs on its own thread while main() only sleeps, so a listener that never
+    # starts leaves a process that systemd and Docker report as running while nothing listens or
+    # is advertised -- Restart= and restart: never fire. Exit so the supervisor retries instead.
+    # socket() returns -1 on failure, never 0, so the upstream check could not fire at all.
+    content = replace_exact(content, b'    if (socket4 == 0)\n', b'    if (socket4 < 0)\n')
+    for message in (b'Failed to create socket.', b'Failed to bind socket.'):
+        content = replace_exact(content,
+            b'        std::cout << "' + message + b'" << std::endl;\n        return;\n',
+            b'        std::cout << "' + message + b'" << std::endl;\n        _exit(1);\n')
+    content = replace_exact(content,
+        b'        std::cout << "Failed to prepare listening socket." << std::endl;\n',
+        b'        std::cout << "Failed to prepare listening socket." << std::endl;\n        _exit(1);\n')
 
 
 if NAME == 'ClientConnection.cpp':

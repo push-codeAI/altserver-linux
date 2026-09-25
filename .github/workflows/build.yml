@@ -116,6 +116,12 @@ jobs:
       - name: Web UI refuses CSRF, rebinding, oversized bodies and double installs
         run: python3 tests/check_web_security.py
 
+      # A Docker healthcheck only marks a container unhealthy, so the stack's checks restart the
+      # service by SIGTERMing PID 1. One failed probe must never do that (an avahi restart is a
+      # few seconds with no advert), and under pid: host PID 1 is the host's systemd.
+      - name: Healthchecks restart only after repeated failures, only via Docker's init
+        run: python3 tests/check_healthcheck.py
+
   check:
     runs-on: ubuntu-latest
     name: "Check Upstream Updates"

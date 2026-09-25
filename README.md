@@ -83,8 +83,8 @@ sudo apt install -y avahi-daemon avahi-utils usbmuxd libimobiledevice-utils
 
 | Host package | Why the stack needs it |
 |---|---|
-| `avahi-daemon` **running** | The containers bind-mount its socket and the system D-Bus socket; it does the actual mDNS publishing |
-| `usbmuxd` | Owns the USB cable for step 2's one-time pairing. The stack bind-mounts `/var/run/usbmuxd` |
+| `avahi-daemon` **running** | It does the actual mDNS publishing; the containers reach it over the bind-mounted system D-Bus socket |
+| `usbmuxd` | Owns the USB cable for step 2's one-time pairing, on the host. The stack does **not** mount `/var/run/usbmuxd`: usbmuxd is udev-activated, so after a boot with no cable that path is missing and Docker would create an empty directory there, which stops the host usbmuxd from ever starting again |
 | `libimobiledevice-utils` | `idevice_id` / `idevicepair`, used to confirm the pairing worked |
 
 Do **not** `systemctl enable usbmuxd` on Ubuntu — it is udev-activated and has no `[Install]`
