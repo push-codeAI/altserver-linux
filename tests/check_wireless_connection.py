@@ -76,13 +76,18 @@ static int failures = 0;
 #define CHECK(cond, what) do { if (cond) printf("ok   %s\n", what); \
     else { printf("FAIL %s\n", what); failures++; } } while (0)
 
-static void make_pair(int& server, int& client)
+// rcvbuf > 0 sizes the client's receive buffer BEFORE connect(), so the window it advertises is
+// negotiated for that size. Shrinking it on a connected socket leaves an advertised window the
+// buffer cannot hold: some kernels then drop segments and the sender stalls for a retransmission
+// timeout (>= 200 ms) -- which is what a short send timeout on the other end then reports.
+static void make_pair(int& server, int& client, int rcvbuf = 0)
 {
     int l = socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in a = {}; a.sin_family = AF_INET; a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     socklen_t n = sizeof(a);
     bind(l, (sockaddr*)&a, n); listen(l, 4); getsockname(l, (sockaddr*)&a, &n);
     client = socket(AF_INET, SOCK_STREAM, 0);
+    if (rcvbuf > 0) setsockopt(client, SOL_SOCKET, SO_RCVBUF, &rcvbuf, sizeof(rcvbuf));
     connect(client, (sockaddr*)&a, n);
     server = accept(l, NULL, NULL);
     close(l);
@@ -148,31 +153,46 @@ int main()
     CHECK(run("RST mid-receive", [w]() { w->ReceiveData(4).get(); }) == THREW_SERVER_ERROR,
           "peer resetting (RST) mid-receive raises ServerError");
 
-    make_pair(s, c);
+    make_pair(s, c, 16384);
     w = new WirelessConnection(s);
     {
         // A send timeout on the server socket makes send() return short while the reader lags,
         // so the loop must resume from the right offset. The original sent once and stopped.
-        timeval tv = { 0, 200000 }; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
+        // The reader drains ~32 KiB per 50 ms, so 2 MiB takes ~3 s: several sends return short
+        // after 1 s, and a 1 s stall with NO progress (which send() reports as EAGAIN, and the
+        // loop rightly treats as a dead peer) would need the reader starved for a whole second.
+        timeval tv = { 1, 0 }; setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv));
         int small = 16384; setsockopt(s, SOL_SOCKET, SO_SNDBUF, &small, sizeof(small));
-        setsockopt(c, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small));
         const size_t total = 2 * 1024 * 1024;
         auto payload = new std::vector<unsigned char>(total);
         for (size_t i = 0; i < total; i++) (*payload)[i] = (unsigned char)(i * 7 + (i >> 16));
         auto received = new std::vector<unsigned char>();
+        auto drained = std::make_shared<std::promise<void>>();
+        auto drainedFuture = drained->get_future();
         int reader_fd = c;
-        std::thread reader([reader_fd, received, total]() {
+        std::thread reader([reader_fd, received, total, drained]() {
             unsigned char buf[65536];
             while (received->size() < total) {
                 ssize_t r = read(reader_fd, buf, sizeof(buf));
                 if (r <= 0) break;
                 received->insert(received->end(), buf, buf + r);
-                usleep(20000);
+                usleep(50000);
             }
+            drained->set_value();
         });
+        printf("     large send: begin\n"); fflush(stdout);
         Outcome o = run("large send", [w, payload]() { w->SendData(*payload).get(); }, 60);
-        shutdown(c, SHUT_RDWR);
+        std::cout.flush(); printf("     large send: end\n"); fflush(stdout);
+        // SendData returns once the last byte is in the kernel, with up to both socket buffers
+        // still in flight: let the reader drain them. Shutting its socket down straight away
+        // (as this once did) truncated the tail whenever the reader was a little behind -- a
+        // false failure on a busy CI runner. Only a reader still waiting after a failed or
+        // stalled send is cut off.
+        if (o != RETURNED || drainedFuture.wait_for(std::chrono::seconds(30)) != std::future_status::ready)
+            shutdown(c, SHUT_RDWR);
         reader.join();
+        if (o != RETURNED || *received != *payload)
+            printf("     large send: outcome %d, %zu of %zu bytes received\n", (int)o, received->size(), total);
         CHECK(o == RETURNED && *received == *payload, "a large payload arrives complete and in order across partial sends");
     }
 
@@ -298,10 +318,22 @@ def main():
             print("FAIL: the rewritten WirelessConnection.cpp does not compile:\n" + build.stderr[-3000:])
             return 1
         run = subprocess.run([exe], capture_output=True, text=True, timeout=180)
-        # WirelessConnection logs every chunk; show only the verdict lines.
-        sys.stdout.write("".join(l + "\n" for l in run.stdout.splitlines()
-                                 if l.startswith(("ok ", "FAIL", "     keepalive", "all checks", "check(s)"))
-                                 or "check(s) failed" in l))
+        # WirelessConnection logs every chunk; show only the verdict lines, and why a send failed.
+        lines = run.stdout.splitlines()
+        sys.stdout.write("".join(l + "\n" for l in lines
+                                 if l.startswith(("ok ", "FAIL", "     keepalive", "     large send: outcome",
+                                                  "all checks", "check(s)", "Failed to send"))
+                                 or "check(s) failed" in l or "still running" in l))
+        # The large send must actually have come back short and been resumed, or the case above
+        # proved nothing about the resume offset.
+        if "     large send: begin" in lines and "     large send: end" in lines:
+            section = lines[lines.index("     large send: begin"):lines.index("     large send: end")]
+            sends = sum(1 for l in section if l.startswith("Sent Bytes Count: "))
+            if sends < 2:
+                print("FAIL the large send completed in %d send() call(s); the resume path was not exercised"
+                      % sends)
+                return 1
+            print("ok   the large send took %d send() calls" % sends)
         if run.returncode != 0:
             print("\nFAIL: the shipped transport mishandles a peer that goes away.")
             return 1
