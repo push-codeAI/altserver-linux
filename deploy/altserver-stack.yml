@@ -125,6 +125,25 @@ services:
         max-size: "10m"
         max-file: "3"
 
+    # netmuxd logs through env_logger, which prints ERROR only unless RUST_LOG is set -- so every
+    # reason it drops the phone (Bonjour TXT record not matched, lockdown/TLS heartbeat refused) is
+    # invisible. These lines are what tell an iOS-update breakage apart from a network problem:
+    #   "TXT record matched UDID ..."          healthy (logged each time the phone re-announces)
+    #   "No paired device matched service ..." this iOS advertises in a form netmuxd cannot match
+    #   "Failed to start lockdown session"     phone found, lockdown/TLS/pairing refused
+    environment:
+      RUST_LOG: "netmuxd=info,netmuxd::mdns=debug"
+      # Optional, read by the healthcheck below. netmuxd v0.4.3 drops the phone on any heartbeat
+      # failure (the phone going to sleep, a Wi-Fi blip, a new DHCP address) but only adds it back
+      # when its Bonjour record CHANGES -- an unchanged re-announcement, or a HomePod/Apple TV
+      # sleep proxy answering for it, leaves it missing until netmuxd restarts, and refreshes fail
+      # with "could not find this device". With the phone's UDID and a FIXED address for it (a DHCP
+      # reservation on the router, and/or its WireGuard IP; space-separated), the healthcheck asks
+      # netmuxd to re-add a missing phone. netmuxd verifies the address itself (lockdown TLS with
+      # the pairing record), so a wrong or unreachable one is simply refused.
+      ALTSERVER_UDID: "${ALTSERVER_UDID:-}"
+      ALTSERVER_PHONE_ADDRESSES: "${ALTSERVER_PHONE_ADDRESSES:-}"
+
     # Runs netmuxd instead of AltServer; the normal entrypoint fetches an IPA and execs the server.
     entrypoint: ["/usr/local/bin/netmuxd"]
     command:
@@ -147,14 +166,17 @@ services:
 
     # One ListDevices round trip on the socket every 5 min (an empty list is healthy). netmuxd
     # binds its socket in a spawned task, so a failed bind leaves the process running with no
-    # socket and restart: never fires. After 3 failures in a row the script SIGTERMs tini
-    # (init: true, required), which exits, so restart: unless-stopped starts a fresh netmuxd.
-    # Skipped on images without the script.
+    # socket and restart: never fires. With ALTSERVER_UDID + ALTSERVER_PHONE_ADDRESSES it also
+    # re-adds a phone netmuxd dropped (above), and treats a listed phone whose lockdownd port is
+    # dead as a failure: that is a stale duplicate entry netmuxd never removes. After 3 failures
+    # in a row the script SIGTERMs tini (init: true, required), which exits, so
+    # restart: unless-stopped starts a fresh netmuxd. Skipped on images without the script.
     healthcheck:
       test: ["CMD-SHELL", "[ ! -f /opt/altserver-web/healthcheck.py ] || python3 /opt/altserver-web/healthcheck.py netmuxd --restart-after 3"]
       # 5 min, not less: netmuxd prints its whole device list for every ListDevices request.
       interval: 5m
-      timeout: 20s
+      # ListDevices (10 s) + one lockdownd probe per listed address (4 s) + AddDevice (6 s each).
+      timeout: 45s
       retries: 3
       start_period: 1m
 

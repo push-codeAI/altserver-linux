@@ -31,7 +31,9 @@ certificate. A paid developer account raises those limits but is not required.
 - **AltJIT on iOS 17+.** Needs a personalised DDI, TSS signing and a RemoteXPC tunnel. Use
   [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) instead.
 - **Pair without a cable.** Wireless pairing is an Apple-TV-only feature and is not available here.
-- **Refresh while your phone is off the network.** It needs to reach the device.
+- **Refresh while your phone is off the network.** It needs to reach the device — and AltStore
+  finds the server by Bonjour, which does not cross a VPN such as WireGuard (see
+  [Wireless refresh](#6-wireless-refresh)).
 
 ### Where to go next
 
@@ -243,6 +245,21 @@ AltStore refreshes itself: it sets an hourly background-fetch interval and runs 
 `BackgroundRefreshAppsOperation`. iOS grants that at its own discretion, so if an app ever expires
 unexpectedly, that is why — not the server.
 
+**Give the phone a fixed address and tell the stack.** netmuxd (v0.4.3) drops the phone on any
+heartbeat failure — the phone going to sleep, a Wi-Fi blip, a new DHCP lease — but adds it back
+only when the phone's Bonjour record *changes*. An unchanged re-announcement, or a HomePod/Apple TV
+answering for a sleeping phone, leaves it missing until netmuxd restarts, and refreshes fail with
+"could not find this device". Reserve an address for the phone on the router, then set
+`ALTSERVER_PHONE_ADDRESSES` (and `ALTSERVER_UDID`) in the stack environment: netmuxd's
+healthcheck re-adds a missing phone every 5 minutes, and restarts netmuxd if it keeps a dead entry.
+
+**Over WireGuard, AltStore cannot find the server.** AltStore discovers AltServer by Bonjour only
+(no manual address anywhere in the app), and mDNS does not cross a WireGuard tunnel: WireGuard
+interfaces have no MULTICAST flag, so neither avahi nor netmuxd uses them. Refresh from AltStore
+(background, Shortcut or the button) works on the home network. Away from home only a
+server-initiated install can reach the phone, and only if netmuxd lists it by its tunnel address
+— put that address in `ALTSERVER_PHONE_ADDRESSES` too.
+
 ### 7. Don't lose it
 
 ```bash
@@ -291,10 +308,12 @@ of a dead deployment is an app that will not open, a week later.
 
 ## Before trusting it unattended
 
-- **Watch it from outside.** Nothing inside AltServer reports its own health: no liveness signal,
-  no re-registration if avahi restarts, and `journalctl -p err` stays empty no matter what breaks.
-  A background refresh that finds no server notifies nobody on either end. The status page at `/`
-  exists for this; have something poll it.
+- **Watch it from outside.** The stack now recovers what it can see: AltServer exits if its
+  listener dies, its mDNS advert is re-registered after an avahi restart, and the healthchecks
+  restart a service that silently stops (three failures in a row, 15 minutes). What nothing on the
+  server can see is a background refresh that never happened: it notifies nobody on either end,
+  and `journalctl -p err` stays empty. The status page at `/` exists for this; have something poll
+  `/healthz`, and keep an eye on the "last refresh" row.
 - **Two checks that cannot tell you anything.** `docker exec altserver idevice_id -l` and the
   wireless row on the status page both use **Debian's** libimobiledevice from the image's apt
   packages, not the vendored copy AltServer links. They were green throughout a bug that broke
@@ -363,6 +382,7 @@ retrying a sign-in in a loop is how Apple IDs get locked.
 | `ALTSERVER_ALLOW_REVOKE` | With `ALTSERVER_NONINTERACTIVE=1`, set to `1` to allow that revoke -- deliberately, once |
 | `ALTSERVER_2FA_TIMEOUT` | Web UI: seconds an unanswered 2FA prompt waits before the install is cancelled (default 600) |
 | `ALTSERVER_GSA_USER_AGENT` | Replaces the User-Agent of the Apple sign-in and 2FA requests (default: the 2019-era values that are proven here). Leave unset unless sign-in starts failing as an outdated client; upstream AltSign moved to `AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)` in September 2026 |
+| `ALTSERVER_PHONE_ADDRESSES` | Stack only (netmuxd healthcheck): the phone's fixed LAN address and/or WireGuard address, space-separated. With `ALTSERVER_UDID` set, a phone netmuxd dropped is re-added (see [Wireless refresh](#6-wireless-refresh)) |
 | `ALTSERVER_WEB_ALLOWED_HOSTS` | Web UI: extra host names it may be reached by. IP addresses, single-label names and `.local` / `.lan` / `.home.arpa` / `.internal` names always work |
 
 There is deliberately **no default anisette server**. The one that used to be hardcoded has

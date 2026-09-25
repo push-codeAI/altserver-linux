@@ -25,7 +25,9 @@
 // first second (REGISTERING) -- which returns 0 but used to publish nothing, ever -- is completed
 // by the event loop. The backoff only resets once avahi confirms a registration, so one that keeps
 // failing cannot become a busy loop. The child still exits at once if python3 or libdns_sd.so is
-// missing, which never gets better and which the parent's liveness check below reports.
+// missing, or if avahi refuses the first registration outright (-65553 D-Bus/AppArmor policy,
+// -65548 name already registered): none of those gets better by waiting, and the parent's
+// liveness check below reports them. Only -65537 means "avahi/D-Bus not up yet".
 static const char kAdvertiseScript[] = R"PY(
 import ctypes as C, select, socket, sys, time
 def log(msg):
@@ -61,6 +63,8 @@ while True:
     if first:
         print('DNSServiceRegister result: %d' % ret)
         sys.stdout.flush()
+        if ret not in (0, -65537):
+            sys.exit(1)     # Refused (D-Bus/AppArmor policy), NameConflict, BadParam: waiting never helps
         first = False
     if ret != 0:
         if not waiting:
@@ -184,7 +188,9 @@ DNSServiceErrorType DNSSD_API DNSServiceRegister
                     "       Verify with the same call this program makes:\n"
                     "           python3 -c \"from ctypes import CDLL; CDLL('libdns_sd.so')\"\n"
                     "       On Debian/Ubuntu install libavahi-compat-libdnssd-dev -- the -dev package is\n"
-                    "       the one providing the unversioned libdns_sd.so symlink, not libdnssd1.\n");
+                    "       the one providing the unversioned libdns_sd.so symlink, not libdnssd1.\n"
+                    "       Or avahi refused the registration: see \"DNSServiceRegister result\" above\n"
+                    "       (-65553 = D-Bus/AppArmor policy, -65548 = the name is already registered).\n");
 
                 return kDNSServiceErr_Unknown;
             }

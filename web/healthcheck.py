@@ -9,7 +9,8 @@ at most one avahi-browse. Stdlib only.
              lines there, and builds before the WirelessConnection fix spun forever on a peer that
              connects and closes.
   netmuxd    one ListDevices round trip on netmuxd's socket. An empty list is healthy -- the phone
-             being away is not a netmuxd fault.
+             being away is not a netmuxd fault -- but with ALTSERVER_UDID + ALTSERVER_PHONE_ADDRESSES
+             a missing phone is re-added with AddDevice, and a listed-but-dead entry is a failure.
   web        GET /api/install/status: proves the HTTP server answers, runs nothing. Not /healthz
              or /api/status -- those run the full check suite (avahi-browse, idevice_id, and a
              lockdownd pairing validation that wakes the phone's radio).
@@ -85,22 +86,68 @@ def altserver():
     return None
 
 
+def _mux(path, message, timeout=10):
+    body = plistlib.dumps(dict(message, ProgName="healthcheck", ClientVersionString="healthcheck"))
+    with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
+        s.settimeout(timeout)
+        s.connect(path)
+        s.sendall(struct.pack("<IIII", 16 + len(body), 1, 8, 1) + body)
+        hdr = s.recv(16, socket.MSG_WAITALL)
+        if len(hdr) < 16:
+            return {}           # netmuxd closes without a reply when it ignores a request
+        length = struct.unpack("<I", hdr[:4])[0]
+        return plistlib.loads(s.recv(length - 16, socket.MSG_WAITALL))
+
+
 def netmuxd(path=os.environ.get("ALTSERVER_NETMUXD_SOCKET", "/run/muxd/usbmuxd")):
-    body = plistlib.dumps({"MessageType": "ListDevices", "ProgName": "healthcheck",
-                           "ClientVersionString": "healthcheck"})
     try:
-        with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as s:
-            s.settimeout(10)
-            s.connect(path)
-            s.sendall(struct.pack("<IIII", 16 + len(body), 1, 8, 1) + body)
-            hdr = s.recv(16, socket.MSG_WAITALL)
-            length = struct.unpack("<I", hdr[:4])[0]
-            reply = plistlib.loads(s.recv(length - 16, socket.MSG_WAITALL))
+        reply = _mux(path, {"MessageType": "ListDevices"})
     except Exception as exc:
         return "%s: %s" % (path, exc)
     if not isinstance(reply.get("DeviceList"), list):
         return "%s: unexpected reply %r" % (path, sorted(reply))
-    return None
+    return _phone(path, reply["DeviceList"])
+
+
+def _phone(path, devices):
+    """netmuxd (v0.4.3) adds a network device only when mdns-sd reports a NEW or CHANGED record,
+    and drops it on any heartbeat failure (SleepyTime, a Wi-Fi blip over ~15 s, a DHCP address
+    change). The phone's unchanged advert then never re-adds it: it stays missing until netmuxd
+    restarts. With ALTSERVER_UDID and ALTSERVER_PHONE_ADDRESSES (its reserved LAN IP and/or
+    WireGuard IP) set, ask netmuxd to add it back. netmuxd verifies the address itself (lockdown
+    TLS with the pairing record, then a heartbeat) and answers Result 0 for a wrong or unreachable
+    one. Sent only when the UDID is absent: for a listed device netmuxd drops AddDevice and logs
+    an ERROR, and two adds in flight at once create duplicate entries. A listed address whose
+    lockdownd port is dead is a stale duplicate netmuxd will never drop: report it, so
+    --restart-after replaces netmuxd."""
+    udid = os.environ.get("ALTSERVER_UDID", "")
+    addrs = os.environ.get("ALTSERVER_PHONE_ADDRESSES", "").replace(",", " ").split()
+    if not udid:
+        return None
+    listed = [d.get("Properties", {}) for d in devices
+              if d.get("Properties", {}).get("SerialNumber") == udid]
+    for props in listed:
+        raw = props.get("NetworkAddress") or b""
+        if len(raw) < 8 or raw[0] != 2:                     # not a Linux sockaddr_in: cannot judge
+            return None
+        try:
+            socket.create_connection((socket.inet_ntoa(raw[4:8]), 62078), timeout=4).close()
+            return None
+        except OSError:
+            pass
+    if listed:
+        return "netmuxd lists %s but none of its addresses answers on 62078" % udid
+    for ip in addrs:
+        try:
+            ok = _mux(path, {"MessageType": "AddDevice", "ConnectionType": "Network",
+                             "ServiceName": "_apple-mobdev2._tcp.local", "IPAddress": ip,
+                             "DeviceID": udid}, timeout=6).get("Result") == 1
+        except Exception:
+            ok = False
+        print("netmuxd did not list %s; AddDevice %s: %s" % (udid, ip, "added" if ok else "no"))
+        if ok:
+            break
+    return None                 # the phone being away is not a netmuxd fault
 
 
 def web(port=os.environ.get("ALTSERVER_WEB_PORT", "8099")):
