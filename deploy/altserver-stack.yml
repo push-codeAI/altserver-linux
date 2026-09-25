@@ -108,7 +108,7 @@ services:
   # and calls socket_connect_unix() on the remainder.
   # --------------------------------------------------------------------------------------------
   netmuxd:
-    image: ghcr.io/ben-diehlci/altserver-linux:latest
+    image: ${ALTSERVER_IMAGE:-ghcr.io/ben-diehlci/altserver-linux:latest}
     container_name: netmuxd
     restart: unless-stopped
 
@@ -146,14 +146,23 @@ services:
       - /var/lib/lockdown:/var/lib/lockdown:ro
 
   altserver:
-    # Published by .github/workflows/build_image.yml. To build from source instead, comment the
-    # image line and uncomment build: — useful if you want a arch other than the published one.
-    image: ghcr.io/ben-diehlci/altserver-linux:latest
+    # Published by .github/workflows/build_image.yml. ALL THREE services run this one image, so
+    # choose it with ALTSERVER_IMAGE (Portainer stack environment or .env) rather than editing
+    # one line -- a `build:` here alone would leave netmuxd and altserver-web on the default.
+    #
+    # The default is linux/amd64 ONLY: on a Raspberry Pi or any arm64 host its pull fails with
+    # "no matching manifest for linux/arm64/v8". There, either point ALTSERVER_IMAGE at a
+    # multi-arch build (ghcr.io/<your-account>/altserver-linux:latest once build_image.yml has
+    # run for your fork), or build locally -- the Dockerfile picks the toolchain for the host's
+    # architecture by itself:
+    #     docker build -f docker/Dockerfile -t altserver-linux:local .
+    #     ALTSERVER_IMAGE=altserver-linux:local   (and turn OFF "re-pull image" in Portainer)
+    image: ${ALTSERVER_IMAGE:-ghcr.io/ben-diehlci/altserver-linux:latest}
+    # Or let compose build it (plain `docker compose`; set ALTSERVER_IMAGE to a local tag so the
+    # other two services use the result):
     # build:
     #   context: ..
     #   dockerfile: docker/Dockerfile
-    #   args:
-    #     BUILDER: ghcr.io/ben-diehlci/altserver_builder_alpine_amd64
     container_name: altserver
     restart: unless-stopped
     depends_on:
@@ -278,7 +287,7 @@ services:
   # Do NOT put it behind the reverse proxy or a Cloudflare Tunnel -- it must not leave the LAN.
   # --------------------------------------------------------------------------------------------
   altserver-web:
-    image: ghcr.io/ben-diehlci/altserver-linux:latest
+    image: ${ALTSERVER_IMAGE:-ghcr.io/ben-diehlci/altserver-linux:latest}
     container_name: altserver-web
     restart: unless-stopped
     init: true

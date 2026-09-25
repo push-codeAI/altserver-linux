@@ -68,18 +68,17 @@ jobs:
         id: name
         run: echo "image=${REGISTRY}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/altserver-linux" >> "$GITHUB_OUTPUT"
 
-      # amd64 only for now. The build stage pulls an ARCH-SPECIFIC alpine builder image, so a
-      # multi-arch build needs a per-arch BUILDER arg rather than a plain platforms: list —
-      # buildx would otherwise run the amd64 toolchain under emulation and still emit an amd64
-      # binary, producing an image that is mislabelled rather than merely slow.
+      # amd64 AND arm64 (Raspberry Pi). The toolchain images are single-arch, and the Dockerfile
+      # picks the matching one from TARGETARCH -- so NO BUILDER build-arg here: a single BUILDER
+      # would force one toolchain onto both platforms and mislabel the other one's binary.
+      # The arm64 leg compiles under the QEMU set up above; build.yml's aarch64 leg, built the
+      # same way, takes ~9 minutes.
       - name: Build and push
         uses: docker/build-push-action@v7
         with:
           context: .
           file: ./docker/Dockerfile
-          build-args: |
-            BUILDER=ghcr.io/ben-diehlci/altserver_builder_alpine_amd64
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ steps.name.outputs.image }}:latest
@@ -89,7 +88,7 @@ jobs:
 
       - name: Summary
         run: |
-          echo "Pushed ${{ steps.name.outputs.image }}:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pushed ${{ steps.name.outputs.image }}:latest (linux/amd64, linux/arm64)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "The package is PRIVATE by default. To let Portainer pull it without credentials," >> "$GITHUB_STEP_SUMMARY"
           echo "make it public once: GitHub -> Packages -> altserver-linux -> Package settings ->" >> "$GITHUB_STEP_SUMMARY"

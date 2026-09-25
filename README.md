@@ -136,6 +136,9 @@ docker compose -f deploy/altserver-stack.yml up -d
 AltStore IPA is fetched automatically on start, resolved from AltStore's own catalogue so it is
 always current.
 
+**Raspberry Pi / arm64:** the default image is amd64-only and fails to pull with "no matching
+manifest for linux/arm64/v8". Set `ALTSERVER_IMAGE` first — see [Download](#download).
+
 Then open **`http://<your-host>:8099`**.
 
 #### Two settings that are load-bearing
@@ -380,13 +383,14 @@ to end up with a server that runs, reports nothing wrong, and is invisible to yo
 ## Download
 
 - Container image: `ghcr.io/<owner>/altserver-linux:latest`, built by
-  [`build_image.yml`](.github/workflows/build_image.yml). **`linux/amd64` only** — a Raspberry Pi
-  or other arm64 host cannot pull it and must build the image locally:
-  `docker build -f docker/Dockerfile -t altserver .` (uncomment the `build:` block in
-  [`deploy/altserver-stack.yml`](deploy/altserver-stack.yml) to have compose do it)
-- Static binaries: GitHub Actions artifacts. Branch pushes build **amd64** only; tags build all
+  [`build_image.yml`](.github/workflows/build_image.yml) for **`linux/amd64` and `linux/arm64`**.
+  The stack's default, `ghcr.io/ben-diehlci/altserver-linux:latest`, is **amd64 only** — on a
+  Raspberry Pi set `ALTSERVER_IMAGE` to your own account's image, or build locally (the Dockerfile
+  picks the toolchain for the host's architecture) and point `ALTSERVER_IMAGE` at the tag:
+  `docker build -f docker/Dockerfile -t altserver-linux:local .`
+- Static binaries: GitHub Actions artifacts. Branch pushes build **aarch64** only; tags build all
   four architectures. **`chmod +x` after downloading** — artifact upload does not preserve the
-  executable bit
+  executable bit. Artifacts expire after 90 days; keep a copy, or push a tag for a release
 
 ---
 
@@ -401,7 +405,7 @@ to end up with a server that runs, reports nothing wrong, and is invisible to yo
     ghcr.io/ben-diehlci/altserver_builder_alpine_amd64 \
     bash -c 'mkdir -p build; cd build; make -f ../Makefile -j"$(nproc)"'
   ```
-  Or build the container image directly: `docker build -t altserver .`
+  Or build the container image directly: `docker build -f docker/Dockerfile -t altserver-linux:local .`
 
 - By hand (note the `cd build` — the Makefile builds into the *current* directory):
   ```

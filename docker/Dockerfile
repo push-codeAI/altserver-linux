@@ -15,12 +15,30 @@
 
 # ---------------------------------------------------------------------------------------------
 # Build stage — uses the project's own alpine toolchain, which carries the static corecrypto,
-# cpprestsdk, boost and libzip this build needs. Override BUILDER for a different architecture:
-#   ..._amd64 (default) | ..._aarch64 | ..._armv7 | ..._i386
+# cpprestsdk, boost and libzip this build needs.
+#
+# Each toolchain image is a SINGLE-ARCH manifest, not a multi-arch index, so BuildKit cannot pick
+# one by platform: handed the wrong one it only warns (InvalidBaseImagePlatform), then dies at the
+# first RUN with "exec format error" -- or, on a host with QEMU registered, compiles AltServer for
+# the WRONG architecture into an image labelled for the right one. So the stage is chosen from
+# TARGETARCH: a plain `docker build` on a Raspberry Pi gets the aarch64 toolchain, on a PC the
+# amd64 one, and `--platform linux/amd64,linux/arm64` gets each its own. BuildKit resolves and
+# pulls only the stage it uses.
+#
+#   --build-arg BUILDER_AMD64=... / BUILDER_ARM64=...  replace one architecture's toolchain
+#   --build-arg BUILDER=...                            force one toolchain for every platform
+#                                                      (the old knob; it must match the target)
+# The legacy (non-BuildKit) builder sets no TARGETARCH and falls back to amd64, as before.
+# netmuxd publishes Linux builds for x86_64 and aarch64 only, so those are the two stages.
 # ---------------------------------------------------------------------------------------------
-ARG BUILDER=ghcr.io/ben-diehlci/altserver_builder_alpine_amd64
+ARG BUILDER_AMD64=ghcr.io/ben-diehlci/altserver_builder_alpine_amd64
+ARG BUILDER_ARM64=ghcr.io/ben-diehlci/altserver_builder_alpine_aarch64
+ARG BUILDER=
 
-FROM ${BUILDER} AS build
+FROM ${BUILDER_AMD64} AS builder-amd64
+FROM ${BUILDER_ARM64} AS builder-arm64
+
+FROM ${BUILDER:-builder-${TARGETARCH:-amd64}} AS build
 
 WORKDIR /src
 COPY . /src
@@ -68,8 +86,6 @@ RUN set -eux; \
     python3 -c "from ctypes import CDLL; CDLL('libdns_sd.so')"; \
     echo "libdns_sd.so loads OK"
 
-COPY --from=build /out/AltServer /usr/local/bin/AltServer
-
 # ---------------------------------------------------------------------------------------------
 # netmuxd. This is what makes WIRELESS refresh possible at all.
 #
@@ -87,15 +103,23 @@ COPY --from=build /out/AltServer /usr/local/bin/AltServer
 # here; bumping is a one-line change and CI rebuilds the image.
 # ---------------------------------------------------------------------------------------------
 ARG NETMUXD_VERSION=v0.4.3
-ARG TARGETARCH
+# The release tarballs' SHA-256, so a replaced or corrupted asset fails the build instead of
+# shipping inside an image that holds an Apple ID password. Bump these WITH the version; compute
+# them with `curl -fsSL <asset-url> | sha256sum`.
+ARG NETMUXD_SHA256_AMD64=85b6598284fc639f2a282584461d05e2090b79bdf3ec949d2a5e5d3dc655dde4
+ARG NETMUXD_SHA256_ARM64=a89d587b094184b41431bc343da6dfa890391ccc7d4b3d6bce02b524f3191ae6
 RUN set -eux; \
-    case "${TARGETARCH:-amd64}" in \
-      amd64) nm_triple=x86_64-unknown-linux-gnu ;; \
-      arm64) nm_triple=aarch64-unknown-linux-gnu ;; \
-      *) echo "netmuxd publishes no build for TARGETARCH=${TARGETARCH}" >&2; exit 1 ;; \
+    # This image's OWN architecture, not TARGETARCH: the legacy builder leaves TARGETARCH empty,
+    # and the old `${TARGETARCH:-amd64}` then fetched the x86_64 build into an arm64 image.
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in \
+      amd64) nm_triple=x86_64-unknown-linux-gnu; nm_sha256="${NETMUXD_SHA256_AMD64}" ;; \
+      arm64) nm_triple=aarch64-unknown-linux-gnu; nm_sha256="${NETMUXD_SHA256_ARM64}" ;; \
+      *) echo "netmuxd publishes no Linux build for ${arch}" >&2; exit 1 ;; \
     esac; \
     curl -fsSL -o /tmp/netmuxd.tar.gz \
       "https://github.com/jkcoxson/netmuxd/releases/download/${NETMUXD_VERSION}/netmuxd-${nm_triple}.tar.gz"; \
+    echo "${nm_sha256}  /tmp/netmuxd.tar.gz" | sha256sum -c -; \
     tar -xzf /tmp/netmuxd.tar.gz -C /tmp; \
     install -m 0755 /tmp/netmuxd /usr/local/bin/netmuxd; \
     rm -f /tmp/netmuxd.tar.gz /tmp/netmuxd; \
@@ -104,6 +128,19 @@ RUN set -eux; \
     # NOTE: the v0.4.3 binary self-reports "netmuxd v0.4.2" -- upstream did not bump the string.
     # That is cosmetic; the download is correct.
     /usr/local/bin/netmuxd --about
+
+# AFTER netmuxd, so that layer no longer depends on the compile: BuildKit fetches netmuxd while
+# AltServer builds, and an AltServer change no longer re-downloads it.
+COPY --from=build /out/AltServer /usr/local/bin/AltServer
+# The toolchain decides AltServer's architecture, this base image everything else's. If they
+# disagree -- a BUILDER override for the wrong arch, or the legacy builder on a Pi with QEMU
+# registered -- the image still builds and AltServer then runs emulated, or not at all.
+# ELF e_machine (offset 18): 3e 00 = x86-64, b7 00 = aarch64.
+RUN set -eu; \
+    arch="$(dpkg --print-architecture)"; \
+    case "$arch" in amd64) want=3e00 ;; arm64) want=b700 ;; *) want=unsupported ;; esac; \
+    got="$(od -An -tx1 -j18 -N2 /usr/local/bin/AltServer | tr -d ' \n')"; \
+    [ "$got" = "$want" ] || { echo "AltServer was built for the wrong architecture (e_machine $got) for this $arch image" >&2; exit 1; }
 
 # Fetches the current AltStore Classic IPA, resolving the URL from AltStore's own catalogue rather
 # than a hardcoded one -- a pinned URL silently installs an ever-older AltStore.
@@ -130,9 +167,10 @@ WORKDIR /data
 #   to be hardcoded is dead, and a shared anisette identity can get Apple IDs locked.
 ENV ALTSERVER_ANISETTE_SERVER=""
 
-# Documents intent only. mDNS needs the host network, so compose must set network_mode: host —
-# a published port cannot help, and Bonjour does not cross a bridge.
-EXPOSE 51820
+# No EXPOSE, deliberately. AltServer listens on an EPHEMERAL port chosen at every start
+# (ConnectionManager sets sin_port = 0) and advertises it over mDNS, which needs network_mode: host
+# anyway -- a published port cannot help, and Bonjour does not cross a bridge. This used to say
+# EXPOSE 51820, which is WireGuard's default port and has nothing to do with AltServer.
 
 # The entrypoint refreshes /data/AltStore.ipa, then execs AltServer with whatever arguments were
 # given. No IPA argument = daemon mode; add one (or docker exec) for a one-time install.
