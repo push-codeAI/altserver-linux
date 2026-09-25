@@ -88,6 +88,12 @@ jobs:
       - name: Install-log redaction actually redacts
         run: python3 tests/check_redaction.py
 
+      # The install page takes an Apple ID password on 0.0.0.0. It accepted cross-origin text/plain
+      # POSTs (CSRF), any Host (DNS rebinding), unbounded bodies, and spawned one AltServer per
+      # concurrent POST. Exercised against a live server with a fake AltServer, not by grepping.
+      - name: Web UI refuses CSRF, rebinding, oversized bodies and double installs
+        run: python3 tests/check_web_security.py
+
   check:
     runs-on: ubuntu-latest
     name: "Check Upstream Updates"
