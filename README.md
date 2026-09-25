@@ -43,6 +43,7 @@ certificate. A paid developer account raises those limits but is not required.
 | Understand the design | [How the build works](#how-the-build-works) and [docs/REVIVAL.md](docs/REVIVAL.md) |
 | Run the binary without Docker | [Reference](#reference) |
 | Deploy with Portainer / compose | [deploy/](deploy/) |
+| Run it 24/7 on a Raspberry Pi | [deploy/pi/](deploy/pi/README.md) — host settings, a read-only health check, a systemd unit |
 
 ---
 

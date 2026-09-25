@@ -66,7 +66,7 @@ info "swap: $(swapon --show=NAME,SIZE --noheadings 2>/dev/null | tr '\n' ' ')"
 have rpi-eeprom-update && info "eeprom: $(rpi-eeprom-update 2>/dev/null | grep -E 'BOOTLOADER|VL805' | tr -s ' ' | tr '\n' ';')"
 # --- avahi / advert
 grep -qE '^[[:space:]]*allow-interfaces=' /etc/avahi/avahi-daemon.conf 2>/dev/null && ok "avahi $(grep -E '^[[:space:]]*allow-interfaces=' /etc/avahi/avahi-daemon.conf)" || info "avahi allow-interfaces unset (publishes on every multicast interface)"
-have avahi-browse && { avahi-browse -rpt _altserver._tcp 2>/dev/null | grep -q '^=' && ok "_altserver._tcp is being advertised" || warn "_altserver._tcp NOT advertised (restart altserver; see avahi drop-in)"; }
+have avahi-browse && { avahi-browse -rpt _altserver._tcp 2>/dev/null | grep -q '^=' && ok "_altserver._tcp is being advertised" || warn "_altserver._tcp NOT advertised (see the 'mDNS:' lines in AltServer's log, and deploy/pi/README.md)"; }
 if have docker; then
   docker info 2>&1 | grep -q 'No memory limit support' && warn "docker: No memory limit support"
   docker ps --format '{{.Names}} {{.Status}}' 2>/dev/null | sed 's/^/INFO  container /'

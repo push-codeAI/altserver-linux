@@ -1,0 +1,64 @@
+# /etc/systemd/system/altserver.service -- the static AltServer binary under systemd, no Docker.
+#
+# The lightest way to run it on a Pi (no dockerd/containerd, ~100 MB less RAM), for when netmuxd
+# and anisette already run elsewhere on the host. deploy/altserver-stack.yml remains the tested,
+# documented route; use this only if you run the bare binary anyway. Install:
+#
+#   sudo useradd --system --home-dir /var/lib/altserver --shell /usr/sbin/nologin altserver
+#   tar xzf AltServer-aarch64.tar.gz && sudo install -m 0755 AltServer-aarch64 /usr/local/bin/AltServer
+#   # The log filter the container uses: AltServer prints the anisette machine identity on every
+#   # refresh and bearer tokens on every sign-in, and this unit's journal is on disk.
+#   sudo install -d /opt/altserver-web && sudo install -m 0644 web/*.py /opt/altserver-web/
+#   sudo install -m 0755 docker/redact-log.py /usr/local/bin/redact-log
+#   sudo cp deploy/pi/altserver.service /etc/systemd/system/ && sudo systemctl daemon-reload
+#   sudo systemctl enable --now altserver
+#
+# Needs on the host: python3 and libavahi-compat-libdnssd-dev (the -dev package ships the
+# unversioned libdns_sd.so the mDNS helper loads), avahi-daemon running.
+[Unit]
+Description=AltServer-Linux daemon (sideload refresh server)
+Wants=network-online.target avahi-daemon.service
+After=network-online.target avahi-daemon.service time-sync.target netmuxd.service
+# Never stop retrying: an unattended box has nobody to run `systemctl reset-failed`.
+StartLimitIntervalSec=0
+
+[Service]
+Type=exec
+User=altserver
+Group=altserver
+# ./AltServerData (signing certificate, profiles) is relative to the working directory. Keep it
+# stable: an install that cannot find the cached key there revokes the certificate.
+StateDirectory=altserver
+StateDirectoryMode=0700
+WorkingDirectory=/var/lib/altserver
+Environment=ALTSERVER_ANISETTE_SERVER=http://127.0.0.1:6969
+# netmuxd's socket. Match its --socket-path; drop the line if netmuxd owns /var/run/usbmuxd.
+Environment=USBMUXD_SOCKET_ADDRESS=UNIX:/run/muxd/usbmuxd
+# With netmuxd the usbmuxd event subscription only keeps a monitor thread reconnecting.
+Environment=ALTSERVER_NO_SUBSCRIBE=1
+# Optional, for secrets only (ALTSERVER_APPLE_ID / _PASSWORD for install runs): mode 0600
+# root:root -- systemd reads it before switching to User=.
+EnvironmentFile=-/etc/altserver/altserver.env
+# The filter also records each successful refresh here -- the one thing worth alerting on is this
+# file getting older than ~4 days (a free Apple ID's apps stop opening on day 7).
+Environment=ALTSERVER_LAST_REFRESH=/var/lib/altserver/last-refresh.json
+# stdout through the credential filter (fails open: unfiltered rather than no log).
+ExecStart=/bin/bash -c 'exec /usr/local/bin/AltServer > >(exec /usr/local/bin/redact-log) 2>&1'
+Restart=always
+RestartSec=10
+StandardInput=null
+# The default control-group kill also stops the python3 mDNS helper and the log filter.
+TimeoutStopSec=15
+# select()/FD_SET on accepted sockets: stay below FD_SETSIZE (1024), so a leak ends in EMFILE --
+# which exits and restarts -- rather than in memory corruption.
+LimitNOFILE=1024
+# Leak backstop. Only enforced with the memory cgroup controller, which the Pi 4 device tree
+# disables (cgroup_disable=memory) unless cmdline.txt adds cgroup_enable=memory.
+MemoryMax=1G
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=yes
+
+[Install]
+WantedBy=multi-user.target
