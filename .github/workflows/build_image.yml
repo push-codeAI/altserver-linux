@@ -4,14 +4,12 @@ name: Build AltServer Image
 # stack can just pull it instead of building on the host.
 #
 # Uses ${{ github.repository_owner }} rather than a hardcoded namespace, so a fork publishes to
-# its OWN namespace and does not fail against someone else's — which is exactly the mistake
-# build_docker.yml makes by hardcoding ghcr.io/nyamisty.
+# its OWN namespace and does not fail against someone else's.
 
 on:
   push:
     branches:
       - new
-      - bd/revival
     paths:
       - 'docker/**'
       - '.dockerignore'
@@ -44,19 +42,23 @@ jobs:
       packages: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v7
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
           fetch-depth: 0
           submodules: recursive
 
       - name: Set up QEMU
-        uses: docker/setup-qemu-action@v4
+        uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+        with:
+          # Runs --privileged and executes every instruction of the emulated arm64 compile, so it
+          # can alter the binary it helps build. Pinned to the digest CI resolved on 2026-09-19.
+          image: docker.io/tonistiigi/binfmt@sha256:400a4873b838d1b89194d982c45e5fb3cda4593fbfd7e08a02e76b03b21166f0
 
       - name: Set up Buildx
-        uses: docker/setup-buildx-action@v4
+        uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
 
       - name: Log in to the Container registry
-        uses: docker/login-action@v4
+        uses: docker/login-action@dbcb813823bdd20940b903addbd779551569679f # v4.6.0
         with:
           registry: ${{ env.REGISTRY }}
           username: ${{ github.actor }}
@@ -68,18 +70,17 @@ jobs:
         id: name
         run: echo "image=${REGISTRY}/$(echo '${{ github.repository_owner }}' | tr '[:upper:]' '[:lower:]')/altserver-linux" >> "$GITHUB_OUTPUT"
 
-      # amd64 only for now. The build stage pulls an ARCH-SPECIFIC alpine builder image, so a
-      # multi-arch build needs a per-arch BUILDER arg rather than a plain platforms: list —
-      # buildx would otherwise run the amd64 toolchain under emulation and still emit an amd64
-      # binary, producing an image that is mislabelled rather than merely slow.
+      # amd64 AND arm64 (Raspberry Pi). The toolchain images are single-arch, and the Dockerfile
+      # picks the matching one from TARGETARCH -- so NO BUILDER build-arg here: a single BUILDER
+      # would force one toolchain onto both platforms and mislabel the other one's binary.
+      # The arm64 leg compiles under the QEMU set up above; build.yml's aarch64 leg, built the
+      # same way, takes ~9 minutes.
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./docker/Dockerfile
-          build-args: |
-            BUILDER=ghcr.io/ben-diehlci/altserver_builder_alpine_amd64
-          platforms: linux/amd64
+          platforms: linux/amd64,linux/arm64
           push: true
           tags: |
             ${{ steps.name.outputs.image }}:latest
@@ -89,7 +90,7 @@ jobs:
 
       - name: Summary
         run: |
-          echo "Pushed ${{ steps.name.outputs.image }}:latest" >> "$GITHUB_STEP_SUMMARY"
+          echo "Pushed ${{ steps.name.outputs.image }}:latest (linux/amd64, linux/arm64)" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
           echo "The package is PRIVATE by default. To let Portainer pull it without credentials," >> "$GITHUB_STEP_SUMMARY"
           echo "make it public once: GitHub -> Packages -> altserver-linux -> Package settings ->" >> "$GITHUB_STEP_SUMMARY"

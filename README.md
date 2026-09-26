@@ -31,7 +31,9 @@ certificate. A paid developer account raises those limits but is not required.
 - **AltJIT on iOS 17+.** Needs a personalised DDI, TSS signing and a RemoteXPC tunnel. Use
   [pymobiledevice3](https://github.com/doronz88/pymobiledevice3) instead.
 - **Pair without a cable.** Wireless pairing is an Apple-TV-only feature and is not available here.
-- **Refresh while your phone is off the network.** It needs to reach the device.
+- **Refresh while your phone is off the network.** It needs to reach the device — and AltStore
+  finds the server by Bonjour, which does not cross a VPN such as WireGuard (see
+  [Wireless refresh](#6-wireless-refresh)).
 
 ### Where to go next
 
@@ -41,6 +43,7 @@ certificate. A paid developer account raises those limits but is not required.
 | Understand the design | [How the build works](#how-the-build-works) and [docs/REVIVAL.md](docs/REVIVAL.md) |
 | Run the binary without Docker | [Reference](#reference) |
 | Deploy with Portainer / compose | [deploy/](deploy/) |
+| Run it 24/7 on a Raspberry Pi | [deploy/pi/](deploy/pi/README.md) — host settings, a read-only health check, a systemd unit |
 
 ---
 
@@ -83,8 +86,8 @@ sudo apt install -y avahi-daemon avahi-utils usbmuxd libimobiledevice-utils
 
 | Host package | Why the stack needs it |
 |---|---|
-| `avahi-daemon` **running** | The containers bind-mount its socket and the system D-Bus socket; it does the actual mDNS publishing |
-| `usbmuxd` | Owns the USB cable for step 2's one-time pairing. The stack bind-mounts `/var/run/usbmuxd` |
+| `avahi-daemon` **running** | It does the actual mDNS publishing; the containers reach it over the bind-mounted system D-Bus socket |
+| `usbmuxd` | Owns the USB cable for step 2's one-time pairing, on the host. The stack does **not** mount `/var/run/usbmuxd`: usbmuxd is udev-activated, so after a boot with no cable that path is missing and Docker would create an empty directory there, which stops the host usbmuxd from ever starting again |
 | `libimobiledevice-utils` | `idevice_id` / `idevicepair`, used to confirm the pairing worked |
 
 Do **not** `systemctl enable usbmuxd` on Ubuntu — it is udev-activated and has no `[Install]`
@@ -135,6 +138,9 @@ docker compose -f deploy/altserver-stack.yml up -d
 **No host preparation beyond step 1.** It uses named volumes, the image is public, and the
 AltStore IPA is fetched automatically on start, resolved from AltStore's own catalogue so it is
 always current.
+
+**Raspberry Pi / arm64:** the default image is amd64-only and fails to pull with "no matching
+manifest for linux/arm64/v8". Set `ALTSERVER_IMAGE` first — see [Download](#download).
 
 Then open **`http://<your-host>:8099`**.
 
@@ -240,6 +246,21 @@ AltStore refreshes itself: it sets an hourly background-fetch interval and runs 
 `BackgroundRefreshAppsOperation`. iOS grants that at its own discretion, so if an app ever expires
 unexpectedly, that is why — not the server.
 
+**Give the phone a fixed address and tell the stack.** netmuxd (v0.4.3) drops the phone on any
+heartbeat failure — the phone going to sleep, a Wi-Fi blip, a new DHCP lease — but adds it back
+only when the phone's Bonjour record *changes*. An unchanged re-announcement, or a HomePod/Apple TV
+answering for a sleeping phone, leaves it missing until netmuxd restarts, and refreshes fail with
+"could not find this device". Reserve an address for the phone on the router, then set
+`ALTSERVER_PHONE_ADDRESSES` (and `ALTSERVER_UDID`) in the stack environment: netmuxd's
+healthcheck re-adds a missing phone every 5 minutes, and restarts netmuxd if it keeps a dead entry.
+
+**Over WireGuard, AltStore cannot find the server.** AltStore discovers AltServer by Bonjour only
+(no manual address anywhere in the app), and mDNS does not cross a WireGuard tunnel: WireGuard
+interfaces have no MULTICAST flag, so neither avahi nor netmuxd uses them. Refresh from AltStore
+(background, Shortcut or the button) works on the home network. Away from home only a
+server-initiated install can reach the phone, and only if netmuxd lists it by its tunnel address
+— put that address in `ALTSERVER_PHONE_ADDRESSES` too.
+
 ### 7. Don't lose it
 
 ```bash
@@ -288,18 +309,22 @@ of a dead deployment is an app that will not open, a week later.
 
 ## Before trusting it unattended
 
-- **Watch it from outside.** Nothing inside AltServer reports its own health: no liveness signal,
-  no re-registration if avahi restarts, and `journalctl -p err` stays empty no matter what breaks.
-  A background refresh that finds no server notifies nobody on either end. The status page at `/`
-  exists for this; have something poll it.
+- **Watch it from outside.** The stack now recovers what it can see: AltServer exits if its
+  listener dies, its mDNS advert is re-registered after an avahi restart, and the healthchecks
+  restart a service that silently stops (three failures in a row, 15 minutes). What nothing on the
+  server can see is a background refresh that never happened: it notifies nobody on either end,
+  and `journalctl -p err` stays empty. The status page at `/` exists for this; have something poll
+  `/healthz`, and keep an eye on the "last refresh" row.
 - **Two checks that cannot tell you anything.** `docker exec altserver idevice_id -l` and the
   wireless row on the status page both use **Debian's** libimobiledevice from the image's apt
   packages, not the vendored copy AltServer links. They were green throughout a bug that broke
   every wireless refresh. The only evidence that refresh works is AltServer's own log.
 - **A misleading error.** Real device faults are *displayed* as "AltServer could not be found",
-  because AltStore remaps them for any server that is not `isPreferred`, and this port hardcodes
-  serverID `"1234567"` where Mac and Windows use a UUID. It will send you to debug mDNS when mDNS
-  is fine.
+  because AltStore remaps them for any server that is not `isPreferred` -- and this port hardcodes
+  serverID `"1234567"` where Mac and Windows use a UUID, so only an AltStore that THIS server
+  installed (it writes that ID into AltStore's Info.plist) treats it as preferred. Otherwise it
+  will send you to debug mDNS when mDNS is fine. AltServer's log now names the device call that
+  failed (`[device] com.apple.misagent failed: lockdownd -27 (Invalid service)` and the like).
 - **`-d` makes things worse.** `libusbmuxd_set_debug_level(debugLogLevel - 2)` underflows, and a
   single `-d` silences the two messages that actually diagnose a netmuxd mismatch.
 - **Changing the Apple ID password kills unattended refresh.** A background refresh has no way to
@@ -308,7 +333,18 @@ of a dead deployment is an app that will not open, a week later.
   separate copies — updating Portainer alone is not enough.
 - **Do not casually re-run the one-shot install.** The revoke-confirmation prompt is compiled out
   on Linux, so a revoke proceeds unattended and invalidates the certificate your installed apps
-  depend on.
+  depend on. It happens whenever the install cannot find the cached key in
+  `./AltServerData/Certificates/` -- so always run installs from the same working directory. Scripted
+  installs should set `ALTSERVER_NONINTERACTIVE=1`, which refuses the revoke instead (exit 6).
+- **iOS 18 and later: an install keeps the other apps' profiles.** The 2022 code removed every
+  other free provisioning profile around each install with a free Apple ID and put them back
+  afterwards; upstream AltServer 1.7.2 stopped doing that on iOS 18+ because it leaves apps
+  "unverified", and so does this port now. The log says which path ran:
+  `Device iOS 27; keeping other free provisioning profiles during install`.
+- **AltStore's refresh removes profiles it does not know about.** On a free Apple ID, AltStore
+  sends the list of apps in its own library, and the server removes every other free provisioning
+  profile. An app installed with the CLI (not through AltStore) stops launching after AltStore's
+  next refresh, until it is installed again.
 
 ---
 
@@ -328,6 +364,13 @@ Usage:  AltServer-Linux options [ ipa-file ]
 No IPA argument starts the daemon. With one, it performs a one-time install — which needs a real
 terminal, because the 2FA code is read from stdin.
 
+An install's exit status says how it ended, so a script can tell a retry from a problem that needs
+a person: `0` installed, `1` other failure, `2` Apple needs a human (2FA code, password), `3`
+anisette server, `4` device unreachable, `5` free-account limit (3 apps, 10 App IDs per 7 days),
+`6` refused to revoke the certificate, `7` another install is running (one install at a time per
+`./AltServerData`, enforced with a lock). Retry 3, 4 and 7 later; stop and look at 2, 5 and 6 --
+retrying a sign-in in a loop is how Apple IDs get locked.
+
 ### Environment
 
 | Variable | Purpose |
@@ -336,6 +379,12 @@ terminal, because the 2FA code is read from stdin.
 | `ALTSERVER_UDID` / `ALTSERVER_APPLE_ID` / `ALTSERVER_APPLE_PASSWORD` | Alternatives to `-u` / `-a` / `-p`. Prefer these: a password passed as `-p` is visible in `ps` to every user on the host |
 | `ALTSERVER_NO_CLIENTINFO_SANITIZE` | Set to `1` to stop rewriting `com.apple.dt.Xcode` in `X-MMe-Client-Info`. Diagnostic only — leave unset |
 | `ALTSTORE_SKIP_FETCH` | Set to `1` to stop the container refreshing `AltStore.ipa` on start |
+| `ALTSERVER_NONINTERACTIVE` | Set to `1` for scripted installs (cron, systemd, a re-sign pipeline). Never waits on stdin, fails at once if Apple asks for a 2FA code, and refuses to revoke the signing certificate |
+| `ALTSERVER_ALLOW_REVOKE` | With `ALTSERVER_NONINTERACTIVE=1`, set to `1` to allow that revoke -- deliberately, once |
+| `ALTSERVER_2FA_TIMEOUT` | Web UI: seconds an unanswered 2FA prompt waits before the install is cancelled (default 600) |
+| `ALTSERVER_GSA_USER_AGENT` | Replaces the User-Agent of the Apple sign-in and 2FA requests (default: the 2019-era values that are proven here). Leave unset unless sign-in starts failing as an outdated client; upstream AltSign moved to `AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)` in September 2026 |
+| `ALTSERVER_PHONE_ADDRESSES` | Stack only (netmuxd healthcheck): the phone's fixed LAN address and/or WireGuard address, space-separated. With `ALTSERVER_UDID` set, a phone netmuxd dropped is re-added (see [Wireless refresh](#6-wireless-refresh)) |
+| `ALTSERVER_WEB_ALLOWED_HOSTS` | Web UI: extra host names it may be reached by. IP addresses, single-label names and `.local` / `.lan` / `.home.arpa` / `.internal` names always work |
 
 There is deliberately **no default anisette server**. The one that used to be hardcoded has
 returned HTTP 502 since 2026-09, and pointing every user at a single shared anisette identity can
@@ -363,13 +412,15 @@ to end up with a server that runs, reports nothing wrong, and is invisible to yo
 ## Download
 
 - Container image: `ghcr.io/<owner>/altserver-linux:latest`, built by
-  [`build_image.yml`](.github/workflows/build_image.yml). **`linux/amd64` only** — a Raspberry Pi
-  or other arm64 host cannot pull it and must build the image locally:
-  `docker build -f docker/Dockerfile -t altserver .` (uncomment the `build:` block in
-  [`deploy/altserver-stack.yml`](deploy/altserver-stack.yml) to have compose do it)
-- Static binaries: GitHub Actions artifacts. Branch pushes build **amd64** only; tags build all
-  four architectures. **`chmod +x` after downloading** — artifact upload does not preserve the
-  executable bit
+  [`build_image.yml`](.github/workflows/build_image.yml) for **`linux/amd64` and `linux/arm64`**.
+  The stack's default, `ghcr.io/ben-diehlci/altserver-linux:latest`, is **amd64 only** — on a
+  Raspberry Pi set `ALTSERVER_IMAGE` to your own account's image, or build locally (the Dockerfile
+  picks the toolchain for the host's architecture) and point `ALTSERVER_IMAGE` at the tag:
+  `docker build -f docker/Dockerfile -t altserver-linux:local .`
+- Static binaries: GitHub Actions artifacts, one `AltServer-<arch>.tar.gz` each (a tarball, so
+  the executable bit survives: `tar xzf AltServer-aarch64.tar.gz`). Branch pushes build **aarch64**
+  only; tags build all four architectures and attach them to a release. Artifacts expire after 90
+  days; keep a copy, or push a tag for a release
 
 ---
 
@@ -384,7 +435,7 @@ to end up with a server that runs, reports nothing wrong, and is invisible to yo
     ghcr.io/ben-diehlci/altserver_builder_alpine_amd64 \
     bash -c 'mkdir -p build; cd build; make -f ../Makefile -j"$(nproc)"'
   ```
-  Or build the container image directly: `docker build -t altserver .`
+  Or build the container image directly: `docker build -f docker/Dockerfile -t altserver-linux:local .`
 
 - By hand (note the `cd build` — the Makefile builds into the *current* directory):
   ```

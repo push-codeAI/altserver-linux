@@ -95,6 +95,61 @@ if F.endswith('AppleAPI+Authentication.cpp'):
         sys.exit(1)
     content = content.replace(_auth_old, _auth_new)
 
+# --- Initialise PKCS12_parse()'s out-parameters -------------------------------------------
+# Certificate(p12Data, password) declares `EVP_PKEY* key; X509* certificate;` uninitialised and
+# relies on PKCS12_parse() to null them. LibreSSL 3.4 (the Alpine 3.15 build) returns early for a
+# NULL PKCS12 -- an empty or truncated ./AltServerData/Certificates/<team>.p12, e.g. after power is
+# lost just after the cache was written -- WITHOUT nulling them, so the nullptr check that follows
+# reads stack garbage. (OpenSSL 3 nulls them first; the dynamic test build does not show this.)
+_p12_old = b'\tEVP_PKEY* key;\r\n\tX509* certificate;\r\n'
+_p12_new = b'\tEVP_PKEY* key = nullptr;\r\n\tX509* certificate = nullptr;\r\n'
+
+if F.endswith('/Certificate.cpp') or F == 'Certificate.cpp':
+    if content.count(_p12_old) != 1:
+        sys.stderr.write(
+            "rewrite_altsign_source.py: PKCS12 out-parameter patch matched %d times, expected 1.\n"
+            "  upstream Certificate.cpp changed; re-check before removing this guard.\n"
+            % content.count(_p12_old))
+        sys.exit(1)
+    content = content.replace(_p12_old, _p12_new)
+
+# --- Let the operator answer an Apple client-identity change without a rebuild --------------
+# GrandSlam requests still say "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0" (macOS 10.14) and the
+# 2FA requests "Xcode" + "X-Xcode-Version: 11.2". Upstream AltSign replaced both on 2026-09-03 and
+# 2026-09-16 ("Apple's servers reject outdated client identities", ec2968c / 468313b) with
+# "AuthKit/1 (Macintosh; OS X 26.5.2) (com.apple.dt.Xcode/26.0)". The defaults are left alone -- they
+# are the ones proven here -- but ALTSERVER_GSA_USER_AGENT overrides every one of them at runtime.
+_ua_sites = (
+    (b'{U("User-Agent"), U("Xcode")},', b'{U("User-Agent"), U(getenv("ALTSERVER_GSA_USER_AGENT") ? getenv("ALTSERVER_GSA_USER_AGENT") : "Xcode")},'),
+    (b'{U("User-Agent"), U("akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0")}', b'{U("User-Agent"), U(getenv("ALTSERVER_GSA_USER_AGENT") ? getenv("ALTSERVER_GSA_USER_AGENT") : "akd/1.0 CFNetwork/978.0.7 Darwin/18.7.0")}'),
+)
+if F.endswith('AppleAPI+Authentication.cpp'):
+    for _old, _new in _ua_sites:
+        if content.count(_old) != 1:
+            sys.stderr.write("rewrite_altsign_source.py: User-Agent patch matched %d times, expected 1: %r\n"
+                             % (content.count(_old), _old))
+            sys.exit(1)
+        content = content.replace(_old, _new)
+
+# --- Archiver.cpp uses std::vector without including <vector> ------------------------
+# UnzipAppBundle() builds a std::vector<char>, but the file never includes <vector>. It compiled
+# only because Alpine 3.15's libstdc++ 10 pulled <vector> in transitively. libstdc++ 13 and 14 do
+# not, and every newer toolchain (clang++ and g++ alike) fails with
+#     Archiver.cpp:284: error: no member named 'vector' in namespace 'std'
+# It is the only missing standard include in the build (all TUs checked with g++ 13/14 and clang 18).
+# Skipped if upstream ever adds the include itself; harmless on the old toolchain.
+_archiver_old = b'#include <fstream>\r\n'
+_archiver_new = b'#include <fstream>\r\n#include <vector>\r\n'
+
+if F.endswith('Archiver.cpp') and b'#include <vector>' not in content:
+    if content.count(_archiver_old) != 1:
+        sys.stderr.write(
+            "rewrite_altsign_source.py: <vector> include anchor matched %d times, expected 1.\n"
+            "  upstream Archiver.cpp changed; re-check whether it still needs <vector>.\n"
+            % content.count(_archiver_old))
+        sys.exit(1)
+    content = content.replace(_archiver_old, _archiver_new)
+
 content = content.replace(b'winsock2.h', b'WinSock2.h')
 
 sys.stdout.buffer.write(content)

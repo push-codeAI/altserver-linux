@@ -5,6 +5,7 @@
 #include "ServerError.hpp"
 
 #include <set>
+#include <charconv>
 #include <ctime>
 #include <cstdlib>
 #include <cstring>
@@ -149,15 +150,19 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 	// copied verbatim into the JSON ErrorResponse sent to the device -- invalid UTF-8 there makes
 	// the phone reject the whole response, losing the message this function worked to build. It
 	// also neutralises terminal escapes, since the CLI path prints this straight to stdout.
-	std::string bodyPreview = body.substr(0, 256);
-	for (auto& character : bodyPreview)
+	auto printable = [](std::string text)
 	{
-		unsigned char byte = static_cast<unsigned char>(character);
-		if (byte < 0x20 || byte > 0x7E)
+		for (auto& character : text)
 		{
-			character = (byte == '\r' || byte == '\n' || byte == '\t') ? ' ' : '.';
+			unsigned char byte = static_cast<unsigned char>(character);
+			if (byte < 0x20 || byte > 0x7E)
+			{
+				character = (byte == '\r' || byte == '\n' || byte == '\t') ? ' ' : '.';
+			}
 		}
-	}
+		return text;
+	};
+	std::string bodyPreview = printable(body.substr(0, 256));
 
 	if (body.empty())
 	{
@@ -231,7 +236,7 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 		throw ServerError(ServerErrorCode::InvalidAnisetteData, {
 			{ LocalizedFailureErrorKey,
 			  "The anisette server at " + anisetteURL + " returned an X-Apple-I-Client-Time that "
-			  "does not begin with YYYY-MM-DDTHH:MM:SS: " + clientTime }
+			  "does not begin with YYYY-MM-DDTHH:MM:SS: " + printable(clientTime.substr(0, 64)) }
 		});
 	}
 
@@ -242,7 +247,7 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 		throw ServerError(ServerErrorCode::InvalidAnisetteData, {
 			{ LocalizedFailureErrorKey,
 			  "The anisette server at " + anisetteURL + " returned an X-Apple-I-Client-Time with a "
-			  "non-UTC offset, which cannot be interpreted reliably: " + clientTime }
+			  "non-UTC offset, which cannot be interpreted reliably: " + printable(clientTime.substr(0, 64)) }
 		});
 	}
 
@@ -261,6 +266,23 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 	std::string oneTimePassword = requireString("X-Apple-I-MD");
 	std::string localUserID = requireString("X-Apple-I-MD-LU");
 	std::string routingInfo = requireString("X-Apple-I-MD-RINFO");
+
+	// This used to be std::atoi, the one unguarded field: garbage became 0 and overflow is
+	// undefined behaviour -- measured, "abc" was forwarded as routingInfo 0, "-5" as
+	// 18446744073709551611 and "99999999999999999999" as 18446744073709551615, each surfacing only
+	// later as an opaque Apple error. Servers send a plain decimal such as "17106176"; accept only
+	// that. from_chars for an unsigned type rejects a sign, whitespace and out-of-range values.
+	unsigned long long routingInfoValue = 0;
+	const char* routingInfoEnd = routingInfo.data() + routingInfo.size();
+	auto routingInfoParse = std::from_chars(routingInfo.data(), routingInfoEnd, routingInfoValue);
+	if (routingInfoParse.ec != std::errc() || routingInfoParse.ptr != routingInfoEnd)
+	{
+		throw ServerError(ServerErrorCode::InvalidAnisetteData, {
+			{ LocalizedFailureErrorKey,
+			  "The anisette server at " + anisetteURL + " returned an X-Apple-I-MD-RINFO that is not "
+			  "an unsigned decimal number: \"" + printable(routingInfo.substr(0, 64)) + "\"" }
+		});
+	}
 	std::string deviceUniqueIdentifier = requireString("X-Mme-Device-Id");
 	std::string deviceSerialNumber = requireString("X-Apple-I-SRL-NO");
 	std::string deviceDescription = requireString("X-MMe-Client-Info");
@@ -304,7 +326,7 @@ std::shared_ptr<AnisetteData> AnisetteDataManager::FetchAnisetteData()
 		machineID,
 		oneTimePassword,
 		localUserID,
-		std::atoi(routingInfo.c_str()),
+		routingInfoValue,
 		deviceUniqueIdentifier,
 		deviceSerialNumber,
 		deviceDescription,

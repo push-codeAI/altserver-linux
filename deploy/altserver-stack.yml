@@ -65,6 +65,17 @@ services:
       # ...but then you must mkdir it and chown it to 1000:1000 first.
       - anisette-config:/home/Alcoholic/.config/anisette-v3
 
+    # Same probe as deploy/anisette-stack.yml: /v3/client_info is a static reply (no ADI, no Apple
+    # contact); never "/", which provisions against Apple on newer images. curl is in this digest
+    # (its second layer installs it). A Portainer signal only: plain Compose never restarts an
+    # unhealthy container, which is what we want here.
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "-o", "/dev/null", "http://127.0.0.1:6969/v3/client_info"]
+      interval: 5m
+      timeout: 10s
+      retries: 3
+      start_period: 5m
+
   # --------------------------------------------------------------------------------------------
   # AltServer itself.
   # --------------------------------------------------------------------------------------------
@@ -97,7 +108,7 @@ services:
   # and calls socket_connect_unix() on the remainder.
   # --------------------------------------------------------------------------------------------
   netmuxd:
-    image: ghcr.io/ben-diehlci/altserver-linux:latest
+    image: ${ALTSERVER_IMAGE:-ghcr.io/ben-diehlci/altserver-linux:latest}
     container_name: netmuxd
     restart: unless-stopped
 
@@ -113,6 +124,25 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+    # netmuxd logs through env_logger, which prints ERROR only unless RUST_LOG is set -- so every
+    # reason it drops the phone (Bonjour TXT record not matched, lockdown/TLS heartbeat refused) is
+    # invisible. These lines are what tell an iOS-update breakage apart from a network problem:
+    #   "TXT record matched UDID ..."          healthy (logged each time the phone re-announces)
+    #   "No paired device matched service ..." this iOS advertises in a form netmuxd cannot match
+    #   "Failed to start lockdown session"     phone found, lockdown/TLS/pairing refused
+    environment:
+      RUST_LOG: "netmuxd=info,netmuxd::mdns=debug"
+      # Optional, read by the healthcheck below. netmuxd v0.4.3 drops the phone on any heartbeat
+      # failure (the phone going to sleep, a Wi-Fi blip, a new DHCP address) but only adds it back
+      # when its Bonjour record CHANGES -- an unchanged re-announcement, or a HomePod/Apple TV
+      # sleep proxy answering for it, leaves it missing until netmuxd restarts, and refreshes fail
+      # with "could not find this device". With the phone's UDID and a FIXED address for it (a DHCP
+      # reservation on the router, and/or its WireGuard IP; space-separated), the healthcheck asks
+      # netmuxd to re-add a missing phone. netmuxd verifies the address itself (lockdown TLS with
+      # the pairing record), so a wrong or unreachable one is simply refused.
+      ALTSERVER_UDID: "${ALTSERVER_UDID:-}"
+      ALTSERVER_PHONE_ADDRESSES: "${ALTSERVER_PHONE_ADDRESSES:-}"
 
     # Runs netmuxd instead of AltServer; the normal entrypoint fetches an IPA and execs the server.
     entrypoint: ["/usr/local/bin/netmuxd"]
@@ -134,15 +164,40 @@ services:
       # Read-only: netmuxd reads the pairing record, it does not maintain it.
       - /var/lib/lockdown:/var/lib/lockdown:ro
 
+    # One ListDevices round trip on the socket every 5 min (an empty list is healthy). netmuxd
+    # binds its socket in a spawned task, so a failed bind leaves the process running with no
+    # socket and restart: never fires. With ALTSERVER_UDID + ALTSERVER_PHONE_ADDRESSES it also
+    # re-adds a phone netmuxd dropped (above), and treats a listed phone whose lockdownd port is
+    # dead as a failure: that is a stale duplicate entry netmuxd never removes. After 3 failures
+    # in a row the script SIGTERMs tini (init: true, required), which exits, so
+    # restart: unless-stopped starts a fresh netmuxd. Skipped on images without the script.
+    healthcheck:
+      test: ["CMD-SHELL", "[ ! -f /opt/altserver-web/healthcheck.py ] || python3 /opt/altserver-web/healthcheck.py netmuxd --restart-after 3"]
+      # 5 min, not less: netmuxd prints its whole device list for every ListDevices request.
+      interval: 5m
+      # ListDevices (10 s) + one lockdownd probe per listed address (4 s) + AddDevice (6 s each).
+      timeout: 45s
+      retries: 3
+      start_period: 1m
+
   altserver:
-    # Published by .github/workflows/build_image.yml. To build from source instead, comment the
-    # image line and uncomment build: — useful if you want a arch other than the published one.
-    image: ghcr.io/ben-diehlci/altserver-linux:latest
+    # Published by .github/workflows/build_image.yml. ALL THREE services run this one image, so
+    # choose it with ALTSERVER_IMAGE (Portainer stack environment or .env) rather than editing
+    # one line -- a `build:` here alone would leave netmuxd and altserver-web on the default.
+    #
+    # The default is linux/amd64 ONLY: on a Raspberry Pi or any arm64 host its pull fails with
+    # "no matching manifest for linux/arm64/v8". There, either point ALTSERVER_IMAGE at a
+    # multi-arch build (ghcr.io/<your-account>/altserver-linux:latest once build_image.yml has
+    # run for your fork), or build locally -- the Dockerfile picks the toolchain for the host's
+    # architecture by itself:
+    #     docker build -f docker/Dockerfile -t altserver-linux:local .
+    #     ALTSERVER_IMAGE=altserver-linux:local   (and turn OFF "re-pull image" in Portainer)
+    image: ${ALTSERVER_IMAGE:-ghcr.io/ben-diehlci/altserver-linux:latest}
+    # Or let compose build it (plain `docker compose`; set ALTSERVER_IMAGE to a local tag so the
+    # other two services use the result):
     # build:
     #   context: ..
     #   dockerfile: docker/Dockerfile
-    #   args:
-    #     BUILDER: ghcr.io/ben-diehlci/altserver_builder_alpine_amd64
     container_name: altserver
     restart: unless-stopped
     depends_on:
@@ -175,6 +230,10 @@ services:
     # which would be a worse first experience than a container with one LSM relaxed. seccomp,
     # namespaces and cgroups still apply either way, so this is still more confined than running
     # AltServer directly on the host -- the actual alternative.
+    #
+    # RASPBERRY PI OS: none of the above applies. Its kernels build AppArmor in but enable no LSM
+    # (bcm2711_defconfig: CONFIG_LSM=""), so Docker skips AppArmor entirely -- this line is
+    # ignored, D-Bus is never denied, and install.sh stops at its kernel check. Leave it as is.
     security_opt:
       - apparmor=${ALTSERVER_APPARMOR:-unconfined}
 
@@ -205,6 +264,13 @@ services:
       # USBMUXD_SOCKET_ADRESS (one D) is silently ignored and costs hours.
       USBMUXD_SOCKET_ADDRESS: UNIX:/run/muxd/usbmuxd
 
+      # netmuxd presents the phone as a Network device, and AltServer's usbmuxd event subscription
+      # only acts on USB devices (DeviceManager's attach handler uses connectedDevices(), which
+      # excludes network ones) -- so with netmuxd it does nothing but keep a monitor thread
+      # reconnecting. Requests look the phone up themselves. Any value disables it, even "0";
+      # remove the line if you ever point AltServer at a USB mux instead.
+      ALTSERVER_NO_SUBSCRIBE: "1"
+
       # The entrypoint refreshes /data/AltStore.ipa on every start, resolving the current
       # version from AltStore's own catalogue -- so there is no IPA to download by hand and
       # no hardcoded URL to go stale. Set to 1 to leave the file alone (e.g. to pin a build).
@@ -232,15 +298,17 @@ services:
       # netmuxd's socket -- the wireless device path. This is the one that matters for refresh.
       - muxd-socket:/run/muxd
 
-      # The host's usbmuxd, kept as well so a plugged-in cable still works if you ever clear
-      # USBMUXD_SOCKET_ADDRESS. Harmless while that variable is set: libusbmuxd never looks here.
-      - /var/run/usbmuxd:/var/run/usbmuxd
+      # NOT the host's /var/run/usbmuxd. usbmuxd is udev-activated, so after a boot with no cable
+      # that path does not exist and Docker creates an empty DIRECTORY there: the host usbmuxd then
+      # dies on every start ("unlink(/var/run/usbmuxd) failed: Is a directory"), and a container
+      # created while it was a socket cannot start at all any more (runc: "not a directory") --
+      # which restart: never retries. AltServer only talks to netmuxd (USBMUXD_SOCKET_ADDRESS).
 
       # mDNS. The image ships python3 + libavahi-compat-libdnssd-dev, but the actual publishing is
-      # done by the HOST's avahi-daemon, reached over these sockets. Without them the server runs,
-      # reports success, and is silently undiscoverable.
+      # done by the HOST's avahi-daemon, which avahi-compat reaches over the system D-Bus ONLY
+      # (/run/avahi-daemon/socket is nss-mdns's protocol and is never opened). Without the bus the
+      # server runs, reports success, and is silently undiscoverable.
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
-      - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket
 
       # REQUIRED for the above to work. libdbus needs a machine ID to connect to the system bus,
       # and debian-slim ships none -- without it avahi fails at client creation with
@@ -248,6 +316,23 @@ services:
       # an avahi policy problem (also fine). Symptom: DNSServiceRegister returns -65553 (Refused).
       - /etc/machine-id:/etc/machine-id:ro
       - /var/lib/dbus/machine-id:/var/lib/dbus/machine-id:ro
+
+    # Every 5 min: AltServer holds a listening socket AND _altserver._tcp is advertised on that
+    # port (/proc reads plus one avahi-browse; it never connects to AltServer). Catches the silent
+    # states restart: cannot see -- an advert that never came back, or a listener that died.
+    # After 3 failures in a row (15 min: never over one blip, or mid-refresh) the script
+    # SIGTERMs tini so restart: unless-stopped starts a fresh AltServer (requires init: true,
+    # set above). Skipped on images without the script.
+    healthcheck:
+      test: ["CMD-SHELL", "[ ! -f /opt/altserver-web/healthcheck.py ] || python3 /opt/altserver-web/healthcheck.py altserver --restart-after 3"]
+      interval: 5m
+      timeout: 60s
+      retries: 3
+      start_period: 3m
+    # select()/FD_SET is used on every accepted socket and FD_SETSIZE is 1024: keep descriptors
+    # below it so a leak ends in EMFILE (which exits and restarts) rather than memory corruption.
+    ulimits:
+      nofile: 1024
 
     # No IPA argument => daemon mode. The first-time install is a separate one-off run; see
     # README.md, Setup step 4. You can do it from Portainer's container console:
@@ -267,7 +352,7 @@ services:
   # Do NOT put it behind the reverse proxy or a Cloudflare Tunnel -- it must not leave the LAN.
   # --------------------------------------------------------------------------------------------
   altserver-web:
-    image: ghcr.io/ben-diehlci/altserver-linux:latest
+    image: ${ALTSERVER_IMAGE:-ghcr.io/ben-diehlci/altserver-linux:latest}
     container_name: altserver-web
     restart: unless-stopped
     init: true
@@ -306,6 +391,10 @@ services:
     # which would be a worse first experience than a container with one LSM relaxed. seccomp,
     # namespaces and cgroups still apply either way, so this is still more confined than running
     # AltServer directly on the host -- the actual alternative.
+    #
+    # RASPBERRY PI OS: none of the above applies. Its kernels build AppArmor in but enable no LSM
+    # (bcm2711_defconfig: CONFIG_LSM=""), so Docker skips AppArmor entirely -- this line is
+    # ignored, D-Bus is never denied, and install.sh stops at its kernel check. Leave it as is.
     security_opt:
       - apparmor=${ALTSERVER_APPARMOR:-unconfined}
 
@@ -321,10 +410,22 @@ services:
       - anisette
 
     environment:
-      # The status page checks this endpoint against the client's actual contract.
+      # The status page checks this endpoint against the client's actual contract: liveness via
+      # /v3/client_info on every poll, the full "/" contract at most every N seconds.
       ALTSERVER_ANISETTE_SERVER: http://127.0.0.1:6969
+      ALTSERVER_ANISETTE_CHECK_INTERVAL: "600"
+      # Independent time reference for the clock check (one HEAD per 15 min, plain HTTP on
+      # purpose). The anisette timestamp cannot catch a wrong HOST clock: both containers read the
+      # same kernel clock. Default is the Debian mirror apt already uses; "off" disables it. The
+      # kernel's NTP state is read with adjtimex(), so no /run/systemd bind mount is needed.
+      ALTSERVER_CLOCK_REFERENCE_URL: "http://deb.debian.org/debian/"
       # Nothing here fetches the IPA; that is altserver's job.
       ALTSTORE_SKIP_FETCH: "1"
+      # The /install flow runs a real AltServer install from this container. The host's
+      # /var/run/usbmuxd is no longer mounted (see altserver), so point it at netmuxd like the
+      # daemon: the install goes over Wi-Fi to the already-paired phone. First-time pairing is
+      # still done with the cable on the HOST (README step 2).
+      USBMUXD_SOCKET_ADDRESS: UNIX:/run/muxd/usbmuxd
 
     volumes:
       # Shares altserver's data volume so the install flow can see the fetched AltStore.ipa.
@@ -333,19 +434,26 @@ services:
       # AltServer install from this container, and libimobiledevice may refresh the pairing
       # record during device work. Read-only here fails in a way that looks like a device fault.
       - /var/lib/lockdown:/var/lib/lockdown
-      # BOTH mux sockets, deliberately. The status page checks each separately: the host's usbmuxd
-      # for a cabled device, netmuxd for a wireless one. Reporting them together would hide
-      # exactly the failure that matters -- USB fine, wireless dead.
-      - /var/run/usbmuxd:/var/run/usbmuxd
+      # netmuxd's socket for the wireless checks. The host's /var/run/usbmuxd is deliberately NOT
+      # mounted (see altserver: after a cable-less boot Docker turns it into a directory, which
+      # breaks the host usbmuxd and stops this container from starting). Pair over USB on the
+      # HOST (README step 2); the pairing page then continues over netmuxd.
       - muxd-socket:/run/muxd
       - /var/run/dbus/system_bus_socket:/var/run/dbus/system_bus_socket
-      - /var/run/avahi-daemon/socket:/var/run/avahi-daemon/socket
       # Same machine-id requirement as altserver -- avahi-browse needs D-Bus too.
       - /etc/machine-id:/etc/machine-id:ro
       - /var/lib/dbus/machine-id:/var/lib/dbus/machine-id:ro
 
     entrypoint: ["python3", "/opt/altserver-web/server.py"]
     command: ["--host", "0.0.0.0", "--port", "8099"]
+    # Liveness only, report-only. NEVER add `|| kill 1` here: with pid: host, PID 1 is the HOST's
+    # systemd, and SIGTERM makes it re-execute itself. (--restart-after refuses to signal anything
+    # but Docker's init, but do not rely on that.)
+    healthcheck:
+      test: ["CMD-SHELL", "[ ! -f /opt/altserver-web/healthcheck.py ] || python3 /opt/altserver-web/healthcheck.py web"]
+      interval: 5m
+      timeout: 20s
+      retries: 3
 
 volumes:
   # Created automatically on first deploy. `docker volume inspect <stack>_anisette-config` shows

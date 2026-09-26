@@ -65,16 +65,25 @@ for c in altserver altserver-web anisette netmuxd; do
         note "$c: no json-file log on disk (driver may not be json-file)"
         continue
     fi
-    size=$(sudo du -h "$logpath" 2>/dev/null | cut -f1)
+    # The json-file driver ROTATES: with max-file 3 the older history sits in <log>.1 and <log>.2
+    # (gzipped when log-opts compress is on), and it holds exactly the same kind of lines. Checking
+    # only the active file reported a host as clean while two rotated files still held tokens.
+    logs=("$logpath")
+    while IFS= read -r rotated; do
+        [ -n "$rotated" ] && logs+=("$rotated")
+    done < <(sudo find "$(dirname "$logpath")" -maxdepth 1 -name "$(basename "$logpath").*" 2>/dev/null | sort)
+    size=$(sudo du -ch "${logs[@]}" 2>/dev/null | tail -n 1 | cut -f1)
     # Count, never print. A hit means credential material is sitting in this file.
     # Count lines that carry a marker but are NOT already redacted. Since docker/redact-log.py
     # masks the VALUE and keeps the LABEL, a successfully filtered line still contains the word
     # "MachineID" -- so a naive marker count reports a leak for a log that is doing its job.
-    hits=$(sudo grep -aiE 'GsIdmsToken|com\.apple\.gs\.|adsid|DsPrsId|MachineID|X-Apple-I-MD' "$logpath" 2>/dev/null \
+    # zgrep reads plain and gzipped files alike; -h keeps file names out of the counted lines.
+    hits=$(sudo zgrep -ahiE 'GsIdmsToken|com\.apple\.gs\.|adsid|DsPrsId|MachineID|X-Apple-I-MD' "${logs[@]}" 2>/dev/null \
            | grep -avc '\[withheld\]')
     hits=${hits:-0}
-    redacted=$(sudo grep -ac '\[withheld\]' "$logpath" 2>/dev/null)
+    redacted=$(sudo zgrep -ah '\[withheld\]' "${logs[@]}" 2>/dev/null | wc -l)
     redacted=${redacted:-0}
+    [ ${#logs[@]} -gt 1 ] && size="${size:-?} in ${#logs[@]} files"
     if [ "${hits:-0}" -gt 0 ]; then
         flag "$c: ${size:-?} log, $hits line(s) carrying credentials or machine identity"
     elif [ "${redacted:-0}" -gt 0 ]; then
@@ -84,31 +93,59 @@ for c in altserver altserver-web anisette netmuxd; do
     fi
     if [ "$CLEAN_LOGS" = "1" ]; then
         sudo truncate -s 0 "$logpath" && note "    truncated (container keeps running; only history is lost)"
+        for rotated in "${logs[@]:1}"; do
+            sudo rm -f -- "$rotated" && note "    removed rotated $(basename "$rotated")"
+        done
     fi
 done
 
 hr; echo "STRAY COPIES -- nothing in the running stack needs these"; hr
-strays=()
-[ -d "$HOME/AltServerData" ] && strays+=("$HOME/AltServerData")
-for g in "$HOME"/anisette-state*.tgz "$HOME"/anisette-identity*.tgz "$HOME"/lockdown-backup*.tgz; do
-    [ -e "$g" ] && strays+=("$g")
-done
-if [ ${#strays[@]} -eq 0 ]; then
-    note "none found"
-else
-    for s in "${strays[@]}"; do
-        flag "$(du -sh "$s" 2>/dev/null | cut -f1)  $s"
+
+# ~/AltServerData is only a stray when the daemon runs in the container. A bare-metal deployment
+# (the static binary, e.g. under systemd) keeps its signing certificate in ./AltServerData relative
+# to its working directory -- often $HOME -- and deleting that is not cleanup: the next install
+# finds no cached .p12, REVOKES the certificate, and every sideloaded app, AltStore included,
+# stops launching. So it counts as live when any AltServer process has $HOME as its working
+# directory, or when there is no altserver container at all.
+altserverdata_live() {
+    local pid cwd
+    for pid in $(pgrep -f AltServer 2>/dev/null); do
+        cwd=$(sudo readlink "/proc/$pid/cwd" 2>/dev/null) || continue
+        [ "$cwd" = "$HOME" ] && return 0
     done
-    note ""
-    note "AltServerData holds a .p12 -- the PRIVATE KEY for your signing certificate."
-    note "The tarballs are backups. Deleting them loses your only disaster-recovery path"
-    note "for the anisette identity and pairing record, so keep them somewhere else first"
-    note "if you want them."
-    if [ "$CLEAN_STRAYS" = "1" ]; then
-        for s in "${strays[@]}"; do
-            rm -rf -- "$s" && note "    removed $s"
-        done
+    ! docker inspect altserver >/dev/null 2>&1
+}
+
+strays=()
+if [ -d "$HOME/AltServerData" ]; then
+    if altserverdata_live; then
+        note "$HOME/AltServerData: LIVE working state of a bare-metal AltServer -- never removed here"
+    else
+        strays+=("$HOME/AltServerData")
     fi
+fi
+
+# The tarballs are the backups README.md step 7 tells you to take. They hold identifying material,
+# so they are reported -- but never deleted by a flag: they are the only disaster-recovery path for
+# the anisette identity and the pairing record, and losing the latter means fetching the cable.
+backups=()
+for g in "$HOME"/anisette-state*.tgz "$HOME"/anisette-identity*.tgz "$HOME"/lockdown-backup*.tgz; do
+    [ -e "$g" ] && backups+=("$g")
+done
+
+if [ ${#strays[@]} -eq 0 ] && [ ${#backups[@]} -eq 0 ]; then
+    note "none found"
+fi
+for s in "${strays[@]}"; do
+    flag "$(du -sh "$s" 2>/dev/null | cut -f1)  $s  (holds a .p12 -- the PRIVATE KEY for your signing certificate)"
+done
+for b in "${backups[@]}"; do
+    flag "$(du -sh "$b" 2>/dev/null | cut -f1)  $b  (backup: move it off this host; not removed by any flag)"
+done
+if [ "$CLEAN_STRAYS" = "1" ]; then
+    for s in "${strays[@]}"; do
+        rm -rf -- "$s" && note "    removed $s"
+    done
 fi
 
 hr; echo "INTERRUPTED INSTALLS -- signed bundles left in container /tmp"; hr

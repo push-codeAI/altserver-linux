@@ -12,7 +12,14 @@ LDID_NEWROOT := $(BUILD_DIR)/ldid_patched
 
 include $(MAIN_DIR)/makefiles/AltWindowsShim.mak
 
-CFLAGS += -I$(ALTSIGN_ROOT) -I$(MINIZIP_ROOT) -I$(LDID_ROOT) -mno-sse
+CFLAGS += -I$(ALTSIGN_ROOT) -I$(MINIZIP_ROOT) -I$(LDID_ROOT)
+# -mno-sse is an x86 option. clang <= 17 only warns on other targets ("argument unused during
+# compilation", visible in every aarch64 CI log), but clang >= 18 REJECTS it: "unsupported option
+# '-mno-sse' for target 'aarch64-alpine-linux-musl'". Pass it only where it means something, or
+# the aarch64/armv7 builds break on any toolchain newer than Alpine 3.15's clang 12.
+ifneq ($(filter x86_64 i386 i486 i586 i686,$(firstword $(subst -, ,$(shell $(CC) -dumpmachine)))),)
+CFLAGS += -mno-sse
+endif
 #CFLAGS += -DLDID_NOTOOLS # will lose some symbol if enable this
 
 CXXFLAGS = $(CFLAGS) -std=c++17
@@ -20,7 +27,7 @@ CXXFLAGS = $(CFLAGS) -std=c++17
 altsign_orifiles := $(wildcard $(ALTSIGN_ROOT)/*.*)
 altsign_newfiles := $(altsign_orifiles:$(ALTSIGN_ROOT)/%=$(ALTSIGN_NEWROOT)/%)
 
-$(ALTSIGN_NEWROOT)/%: $(ALTSIGN_ROOT)/%
+$(ALTSIGN_NEWROOT)/%: $(ALTSIGN_ROOT)/% $(ROOT_DIR)/rewrite_altsign_source.py
 	mkdir -p `dirname "$@"`
 	python3 $(ROOT_DIR)/rewrite_altsign_source.py "$<" > $@
 
@@ -31,7 +38,7 @@ altsign_src := $(filter %.cpp,$(altsign_newfiles))
 ldid_orifiles := $(LDID_ROOT)/ldid.cpp $(LDID_ROOT)/lookup2.c
 ldid_newfiles := $(ldid_orifiles:$(LDID_ROOT)/%=$(LDID_NEWROOT)/%)
 
-$(LDID_NEWROOT)/%: $(LDID_ROOT)/%
+$(LDID_NEWROOT)/%: $(LDID_ROOT)/% $(ROOT_DIR)/rewrite_ldid_source.py
 	mkdir -p `dirname "$@"`
 	python3 $(ROOT_DIR)/rewrite_ldid_source.py "$<" > $@
 

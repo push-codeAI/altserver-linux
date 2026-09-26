@@ -27,15 +27,69 @@ should not be exposed to the LAN, and never to the internet.
 """
 
 import argparse
+import ipaddress
 import json
 import os
+import re
 import sys
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlsplit
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import status_checks  # noqa: E402
 import pairing  # noqa: E402
 import installer  # noqa: E402
+
+# The install form accepts an Apple ID password, and the status/pairing pages report device
+# identifiers. Two browser-borne attacks matter even on a home LAN:
+#   * DNS rebinding -- a page on evil.example rebinds its name to this host's LAN IP, then the
+#     browser sends requests here with Host: evil.example. Refusing unknown Host values breaks it.
+#   * CSRF -- a page cross-origin POSTs to /api/install/start. text/plain skips the CORS preflight,
+#     so the do_POST guards below require application/json (which forces a preflight this server
+#     never answers) and reject a mismatched Origin.
+# The allowlist is built so a normal home user never trips it: IP literals, localhost, single-label
+# hostnames (raspberrypi, rasai), and names under the suffixes home networks actually use -- .local
+# (mDNS), .home.arpa (RFC 8375), .internal (ICANN-reserved), and the undelegated .lan / .home /
+# .localdomain that consumer routers hand out. An attacker cannot register any of those in public
+# DNS, which is what a rebinding page needs. Extra names go in ALTSERVER_WEB_ALLOWED_HOSTS.
+_ALLOWED_HOSTS_ENV = {
+    h.strip().lower().rstrip(".")
+    for h in re.split(r"[,\s]+", os.environ.get("ALTSERVER_WEB_ALLOWED_HOSTS", ""))
+    if h.strip()
+}
+_PRIVATE_SUFFIXES = (".local", ".home.arpa", ".internal", ".lan", ".home", ".localdomain")
+MAX_BODY_BYTES = 64 * 1024
+
+
+def _hostname_only(host):
+    """Return just the hostname from a Host header value, dropping any :port and [] brackets."""
+    host = (host or "").strip()
+    if host.startswith("["):                 # [::1] or [::1]:8099
+        end = host.find("]")
+        return host[1:end] if end != -1 else host[1:]
+    if host.count(":") == 1:                  # name:port or 1.2.3.4:port
+        return host.rsplit(":", 1)[0]
+    return host                               # bare name, or bare IPv6 (no brackets)
+
+
+def _host_allowed(host_header):
+    # A missing Host (HTTP/1.0, raw local tooling) is not a browser-rebinding vector, which is the
+    # only thing this guard defends; direct network access is a firewall's job, not this check's.
+    if not host_header:
+        return True
+    name = _hostname_only(host_header).strip().lower().rstrip(".")
+    if not name:
+        return False
+    try:
+        ipaddress.ip_address(name)            # any IPv4/IPv6 literal
+        return True
+    except ValueError:
+        pass
+    if name == "localhost" or name.endswith(_PRIVATE_SUFFIXES):
+        return True
+    if "." not in name:                       # single-label host: raspberrypi, rasai, ...
+        return True
+    return name in _ALLOWED_HOSTS_ENV
 
 # The three pages share a <head> but each has its own <body>, so the tab bar is inserted into each
 # rather than living in one template. aria-current is what actually marks the active tab -- the
@@ -136,7 +190,7 @@ PAGE = """<!doctype html>
   </div>
 
   <footer>
-    Refreshes every 30s. Read-only &mdash; this page does not sign in or change anything.
+    Refreshes every 30s (checks are cached for up to 60s). Read-only &mdash; this page does not sign in or change anything.
     Raw JSON at <code>/api/status</code>.
   </footer>
 </div>
@@ -215,7 +269,10 @@ function setWatching(on, reason){
 
 logBtn.addEventListener('click', () => setWatching(logTimer === null));
 
-load(); setInterval(load, 30000);
+// Only while the tab is visible: every poll makes anisette log the machine identity and
+// netmuxd print its device list, so a forgotten tab fills both logs around the clock.
+load(); setInterval(() => { if (!document.hidden) load(); }, 30000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 </script>
 </body>
 </html>
@@ -235,7 +292,7 @@ PAIRING_PAGE = PAIRING_PAGE[:PAIRING_PAGE.index("<body>")] + """<body>
     after this step refreshing happens over Wi-Fi and the cable is never needed again.
   </p>
   <div id="steps"></div>
-  <footer>Re-checks every 5s while you work. Run the commands shown on the server itself.</footer>
+  <footer>Re-checks every 5s while you work (every minute once paired). Run the commands shown on the server itself.</footer>
 </div>
 <script>
 function esc(s){ return String(s).replace(/[&<>\"']/g, c =>
@@ -244,6 +301,7 @@ const PILL = {ok:'ok', todo:'warn', blocked:'fail'};
 async function load(){
   try{
     const d = await (await fetch('/api/pairing',{cache:'no-store'})).json();
+    paired = !!d.paired;
     document.getElementById('when').textContent =
       d.paired ? 'Paired \u2713' : ('Next: ' + (d.next||''));
     document.getElementById('steps').innerHTML = d.steps.map((s,i) => `
@@ -263,7 +321,13 @@ async function load(){
       '<span class="summary">Status service unreachable</span></div></div>';
   }
 }
-load(); setInterval(load, 5000);
+// Only while the tab is visible: every poll makes anisette log the machine identity and
+// netmuxd print its device list, so a forgotten tab fills both logs around the clock.
+let paired = false, lastLoad = 0;  // 5 s while pairing, 60 s once paired
+async function tick(){ if (document.hidden || Date.now() - lastLoad < (paired ? 60000 : 5000)) return;
+  lastLoad = Date.now(); await load(); }
+tick(); setInterval(tick, 5000);
+document.addEventListener('visibilitychange', () => { if (!document.hidden) load(); });
 </script>
 </body>
 </html>
@@ -306,6 +370,11 @@ INSTALL_PAGE = PAGE[:PAGE.index("<body>")].replace(
     <span id="tfamsg" class="meta"></span>
   </form>
 
+  <div id="cancelbox" style="display:none;margin:-.2rem 0 .6rem">
+    <button type="button" class="act" onclick="cancelInstall()">Cancel install</button>
+    <span class="meta">&nbsp;Stops the running sign-in. An unanswered 2FA prompt also gives up by itself after 10 minutes.</span>
+  </div>
+
   <div class="card" id="logbox" style="display:none">
     <div class="row"><span class="name">Progress</span></div>
     <pre id="log" class="detail" style="max-height:22rem;overflow:auto;white-space:pre-wrap"></pre>
@@ -347,12 +416,19 @@ async function sendCode(e){
   if (d.ok) document.getElementById('code').value = '';
   return false;
 }
+async function cancelInstall(){
+  const d = await post('/api/install/cancel', {});
+  showMsg(d.ok ? '' : (d.error || 'Could not cancel the install.'));
+  return false;
+}
 async function poll(){
   try{
     const d = await (await fetch('/api/install/status',{cache:'no-store'})).json();
     document.getElementById('state').textContent =
       d.state + (d.elapsed ? ' \u00b7 ' + d.elapsed + 's' : '');
     document.getElementById('tfa').style.display = d.state === 'awaiting_2fa' ? '' : 'none';
+    document.getElementById('cancelbox').style.display =
+      (d.state === 'running' || d.state === 'awaiting_2fa') ? '' : 'none';
     document.getElementById('logbox').style.display = d.lines.length ? '' : 'none';
     const log = document.getElementById('log');
     const atBottom = log.scrollTop + log.clientHeight >= log.scrollHeight - 20;
@@ -412,6 +488,10 @@ INSTALL_PAGE = _with_nav(INSTALL_PAGE, "/install")
 
 class Handler(BaseHTTPRequestHandler):
     server_version = "AltServerStatus/0.1"
+    # Socket read/write timeout. Without it a client that opens a connection and never finishes
+    # its request holds a server thread forever, and ThreadingHTTPServer starts one per connection.
+    # It bounds socket I/O only -- a slow status check does not count against it.
+    timeout = 60
 
     def _send(self, code, body, content_type):
         payload = body.encode("utf-8")
@@ -422,7 +502,62 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(payload)
 
+    def _host_ok(self):
+        """Reject a disallowed Host with 403. Applies to GET too: rebinding reads /api/status,
+        /api/pairing and /api/logs, which expose device identifiers."""
+        if _host_allowed(self.headers.get("Host")):
+            return True
+        self._send(403,
+                   "Refused: the Host header %r is not allowed. Reach this service by IP address, "
+                   "as localhost, by a single-label name or one under .local/.lan/.home.arpa/"
+                   ".internal, or add the name to ALTSERVER_WEB_ALLOWED_HOSTS. This blocks "
+                   "DNS-rebinding from a browser.\n"
+                   % self.headers.get("Host", ""),
+                   "text/plain; charset=utf-8")
+        return False
+
+    def _read_json_body(self):
+        """Return (ok, obj_or_None). Enforces JSON content type, an Origin that matches Host, and
+        a sane, capped Content-Length -- the last of which also closes the unbounded-read hang."""
+        ctype = (self.headers.get("Content-Type") or "").split(";", 1)[0].strip().lower()
+        if ctype != "application/json":
+            # A cross-origin form/fetch can send text/plain WITHOUT a CORS preflight; requiring
+            # JSON forces a preflight this server never answers, so the browser blocks the CSRF.
+            self._send(415, json.dumps({"ok": False,
+                       "error": "Content-Type must be application/json."}), "application/json")
+            return False, None
+
+        origin = self.headers.get("Origin")
+        if origin:
+            if urlsplit(origin).netloc != (self.headers.get("Host") or ""):
+                self._send(403, json.dumps({"ok": False,
+                           "error": "Cross-origin request refused."}), "application/json")
+                return False, None
+
+        raw = self.headers.get("Content-Length")
+        try:
+            length = int(raw) if raw is not None else 0
+        except (TypeError, ValueError):
+            self._send(400, json.dumps({"ok": False, "error": "bad request"}), "application/json")
+            return False, None
+        if length < 0 or length > MAX_BODY_BYTES:
+            self._send(413, json.dumps({"ok": False,
+                       "error": "Request body missing, negative or too large."}), "application/json")
+            return False, None
+
+        try:
+            body = json.loads(self.rfile.read(length) or b"{}")
+        except Exception:
+            body = None
+        if not isinstance(body, dict):
+            # A JSON array or scalar would reach body.get() below and kill the handler thread.
+            self._send(400, json.dumps({"ok": False, "error": "bad request"}), "application/json")
+            return False, None
+        return True, body
+
     def do_GET(self):
+        if not self._host_ok():
+            return
         path = self.path.split("?", 1)[0]
         if path in ("/", "/index.html"):
             self._send(200, PAGE, "text/html; charset=utf-8")
@@ -466,23 +601,40 @@ class Handler(BaseHTTPRequestHandler):
                         "why": "Could not read %s: %s" % (path_log, exc)}
             self._send(200, json.dumps(data), "application/json")
         elif path == "/api/status":
+            # Served from a short shared cache: ?refresh=1 forces a new run, ?deep=1 also
+            # re-validates the pairing against the phone (status_checks.cached_run_all).
+            query = self.path.partition("?")[2].split("&")
             try:
-                data = status_checks.run_all()
+                data = status_checks.cached_run_all(
+                    max_age=0 if "refresh=1" in query else None, deep="deep=1" in query)
             except Exception as exc:  # never let a check crash the dashboard
                 data = {"overall": "fail", "host": "", "checks": [{
                     "name": "Status service", "state": "fail",
                     "summary": "A check raised an exception", "detail": str(exc), "fix": ""}]}
             self._send(200, json.dumps(data), "application/json")
+        elif path == "/healthz":
+            # For external watchdogs (Uptime Kuma, `curl -fsS` from cron): poll as often as you
+            # like; it answers from the cache and runs the real checks at most once per
+            # ALTSERVER_HEALTHZ_MAX_AGE seconds. 503 exactly when the page would show a FAIL.
+            try:
+                data = status_checks.cached_run_all(
+                    max_age=float(os.environ.get("ALTSERVER_HEALTHZ_MAX_AGE", "300")))
+                failing = [c["name"] for c in data["checks"] if c["state"] == "fail"]
+                code, body = (503 if failing else 200), {
+                    "overall": data["overall"], "failing": failing, "age_s": data["age_s"]}
+            except Exception as exc:
+                code, body = 503, {"overall": "fail", "failing": ["Status service"],
+                                   "error": str(exc)}
+            self._send(code, json.dumps(body), "application/json")
         else:
             self._send(404, "not found\n", "text/plain; charset=utf-8")
 
     def do_POST(self):
+        if not self._host_ok():
+            return
         path = self.path.split("?", 1)[0]
-        try:
-            length = int(self.headers.get("Content-Length") or 0)
-            body = json.loads(self.rfile.read(length) or b"{}")
-        except Exception:
-            self._send(400, json.dumps({"ok": False, "error": "bad request"}), "application/json")
+        ok, body = self._read_json_body()
+        if not ok:
             return
 
         if path == "/api/install/start":
@@ -492,6 +644,11 @@ class Handler(BaseHTTPRequestHandler):
             self._send(200, json.dumps({"ok": ok, "error": err}), "application/json")
         elif path == "/api/install/code":
             ok, err = installer.INSTALLER.submit_code(body.get("code", ""))
+            self._send(200, json.dumps({"ok": ok, "error": err}), "application/json")
+        elif path == "/api/install/cancel":
+            # Escape hatch for an abandoned or wrong sign-in: terminate the child and return to a
+            # terminal state without waiting for the 2FA timeout or a container restart.
+            ok, err = installer.INSTALLER.cancel()
             self._send(200, json.dumps({"ok": ok, "error": err}), "application/json")
         else:
             self._send(404, json.dumps({"ok": False, "error": "not found"}), "application/json")
